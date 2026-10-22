@@ -145,24 +145,48 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
   useEffect(() => {
     seedData();
-    const initialUsers: User[] = JSON.parse(localStorage.getItem(USERS_KEY) || '[]');
-    setUsersCache(initialUsers);
+    const currentUsers: User[] = JSON.parse(localStorage.getItem(USERS_KEY) || '[]');
+    const legacyUsers: User[] = JSON.parse(localStorage.getItem('aegiscare_users') || '[]');
+    const mergedLocalUsers: User[] = [...currentUsers];
+    for (const lu of legacyUsers) {
+      if (!mergedLocalUsers.some((u) => u.id === lu.id)) {
+        mergedLocalUsers.push(lu);
+      }
+    }
+    setUsersCache(mergedLocalUsers);
 
-    const storedUser = localStorage.getItem(CURRENT_USER_KEY);
+    const storedUser = localStorage.getItem(CURRENT_USER_KEY) || localStorage.getItem('aegiscare_current_user');
     if (storedUser) {
-      setUser(JSON.parse(storedUser));
+      const parsedUser = JSON.parse(storedUser) as User;
+      setUser(parsedUser);
+      localStorage.setItem(CURRENT_USER_KEY, JSON.stringify(parsedUser));
+      if (!mergedLocalUsers.some((u) => u.id === parsedUser.id)) {
+        mergedLocalUsers.push(parsedUser);
+      }
     }
 
-    // Sync users from backend API
+    // Sync users with backend API (bidirectional merge so local users are also saved on backend)
     fetch(`${API_BASE}/users`)
       .then((res) => (res.ok ? res.json() : Promise.reject()))
       .then((data: { users: User[] }) => {
-        if (Array.isArray(data.users) && data.users.length > 0) {
-          localStorage.setItem(USERS_KEY, JSON.stringify(data.users));
-          setUsersCache(data.users);
+        if (Array.isArray(data.users)) {
+          const combined = [...data.users];
+          for (const localU of mergedLocalUsers) {
+            if (!combined.some((u) => u.id.toLowerCase() === localU.id.toLowerCase())) {
+              combined.push(localU);
+              // Push missing local user to backend database
+              fetch(`${API_BASE}/users/${encodeURIComponent(localU.id)}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(localU),
+              }).catch(() => {});
+            }
+          }
+          localStorage.setItem(USERS_KEY, JSON.stringify(combined));
+          setUsersCache(combined);
           if (storedUser) {
             const parsed = JSON.parse(storedUser) as User;
-            const refreshed = data.users.find((u) => u.id === parsed.id);
+            const refreshed = combined.find((u) => u.id.toLowerCase() === parsed.id.toLowerCase());
             if (refreshed) {
               setUser(refreshed);
               localStorage.setItem(CURRENT_USER_KEY, JSON.stringify(refreshed));

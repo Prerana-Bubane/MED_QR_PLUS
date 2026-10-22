@@ -1,16 +1,33 @@
-import React, { useEffect, useState } from 'react';
-import { Html5QrcodeScanner } from 'html5-qrcode';
+import React, { useEffect, useState, useRef } from 'react';
+import { Html5QrcodeScanner, Html5Qrcode } from 'html5-qrcode';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
-import { Scan, ShieldAlert, KeyRound } from 'lucide-react';
+import { Scan, ShieldAlert, KeyRound, Upload } from 'lucide-react';
 import type { Patient } from '../types';
 
 export const Scanner = () => {
   const [manualId, setManualId] = useState('MQR-2026-12345');
   const [otp, setOtp] = useState('');
   const [error, setError] = useState('');
+  const [scanningFile, setScanningFile] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const navigate = useNavigate();
   const { user, getAllUsers, logActivity } = useAuth();
+
+  // Extract Patient ID from either a full QR URL (http://.../scan-result/3?id=MQR-...) or raw ID string
+  const extractPatientId = (rawText: string): string => {
+    const trimmed = rawText.trim();
+    try {
+      if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+        const url = new URL(trimmed);
+        const idParam = url.searchParams.get('id');
+        if (idParam) return idParam.trim();
+      }
+    } catch {
+      // Fall through to raw string
+    }
+    return trimmed;
+  };
 
   useEffect(() => {
     const scanner = new Html5QrcodeScanner(
@@ -21,28 +38,43 @@ export const Scanner = () => {
 
     scanner.render(
       (decodedText) => {
-        scanner.clear();
+        scanner.clear().catch(() => {});
         handleScan(decodedText);
       },
-      (err) => {
-        console.warn(err);
-      }
+      () => {}
     );
 
     return () => {
-      scanner.clear().catch(console.error);
+      scanner.clear().catch(() => {});
     };
   }, []);
 
-  const handleScan = async (id: string, providedOtp?: string) => {
+  const handleScan = async (rawInput: string, providedOtp?: string) => {
     setError('');
+    const extractedId = extractPatientId(rawInput);
+
     const users = getAllUsers();
-    const patient = users.find((u) => u.id.toLowerCase() === id.trim().toLowerCase() && u.role === 'Patient') as
-      | Patient
-      | undefined;
+    let patient = users.find(
+      (u) => u.id.toLowerCase() === extractedId.toLowerCase() && u.role === 'Patient'
+    ) as Patient | undefined;
+
+    // Also check backend API if not found in local cache
+    if (!patient) {
+      try {
+        const res = await fetch(`/api/users/${encodeURIComponent(extractedId)}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.user && data.user.role === 'Patient') {
+            patient = data.user as Patient;
+          }
+        }
+      } catch {
+        // Ignore network error
+      }
+    }
 
     if (!patient) {
-      setError('Invalid QR code or Patient ID not found.');
+      setError(`Invalid QR code or Patient ID "${extractedId}" not found.`);
       return;
     }
 
@@ -80,7 +112,25 @@ export const Scanner = () => {
       );
     }
 
-    navigate(`/scan-result/${tier}?id=${patient.id}`);
+    navigate(`/scan-result/${tier}?id=${encodeURIComponent(patient.id)}`);
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setError('');
+    setScanningFile(true);
+
+    try {
+      const html5QrCode = new Html5Qrcode('qr-file-reader-hidden');
+      const decodedText = await html5QrCode.scanFile(file, true);
+      html5QrCode.clear();
+      setScanningFile(false);
+      handleScan(decodedText, otp);
+    } catch {
+      setScanningFile(false);
+      setError('Could not read a valid QR code from that image. Please upload a clear MedQR+ PNG.');
+    }
   };
 
   const handleManualSubmit = (e: React.FormEvent) => {
@@ -97,7 +147,7 @@ export const Scanner = () => {
         <div>
           <h2 className="text-2xl font-bold text-gray-900">QR Scanner &amp; OTP Verification</h2>
           <p className="text-sm text-gray-500">
-            Scan a MEDQR+ pass or enter Patient ID + 6-Digit OTP to unlock medical records.
+            Scan via camera, upload a downloaded QR Code PNG, or enter Patient ID + OTP below.
           </p>
         </div>
       </div>
@@ -108,12 +158,43 @@ export const Scanner = () => {
         </div>
       )}
 
+      {/* Hidden element used by Html5Qrcode.scanFile */}
+      <div id="qr-file-reader-hidden" className="hidden"></div>
+
       <div className="bg-white rounded-[16px] shadow-sm border border-gray-100 overflow-hidden text-center">
-        <div className="p-8 border-b border-gray-100">
-          <div id="reader" className="mx-auto overflow-hidden rounded-2xl max-w-sm mb-4"></div>
-          <p className="text-sm text-gray-500">Position the QR code within the frame to scan automatically.</p>
+        {/* Upload QR Code PNG Option */}
+        <div className="p-6 bg-[#10B981]/5 border-b border-gray-100 flex flex-col sm:flex-row items-center justify-between gap-4">
+          <div className="text-left">
+            <h3 className="font-bold text-gray-900 text-sm">Have a downloaded MedQR+ PNG file?</h3>
+            <p className="text-xs text-gray-500">
+              Upload the QR code image file directly to scan and open the patient's record immediately.
+            </p>
+          </div>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            onChange={handleFileUpload}
+            className="hidden"
+          />
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={scanningFile}
+            className="bg-[#10B981] hover:bg-[#059669] text-white px-5 py-2.5 rounded-[10px] text-xs font-bold flex items-center gap-2 shadow-sm transition-colors shrink-0"
+          >
+            <Upload size={16} />
+            {scanningFile ? 'Decoding QR...' : 'Upload QR Image (.PNG)'}
+          </button>
         </div>
 
+        {/* Live Camera Scanner */}
+        <div className="p-8 border-b border-gray-100">
+          <div id="reader" className="mx-auto overflow-hidden rounded-2xl max-w-sm mb-4"></div>
+          <p className="text-sm text-gray-500">Position the QR code within the camera frame to scan automatically.</p>
+        </div>
+
+        {/* Manual ID & OTP Fallback */}
         <div className="p-8 bg-gray-50 text-left">
           <h3 className="font-bold text-sm text-gray-700 uppercase tracking-wider mb-4 text-center">
             Manual Patient ID &amp; 6-Digit OTP Entry
@@ -147,7 +228,7 @@ export const Scanner = () => {
 
             <button
               type="submit"
-              className="w-full bg-[#10B981] hover:bg-[#059669] text-white px-5 py-3 rounded-[12px] text-sm font-bold shadow-sm transition-colors"
+              className="w-full bg-[#1e293b] hover:bg-[#0f172a] text-white px-5 py-3 rounded-[12px] text-sm font-bold shadow-sm transition-colors"
             >
               {otp.trim() ? 'Verify OTP & Unlock Full Records (Tier 2)' : 'Lookup Patient Pass (Tier 3 View)'}
             </button>

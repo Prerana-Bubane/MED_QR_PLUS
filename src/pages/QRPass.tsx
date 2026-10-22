@@ -1,7 +1,8 @@
 import { useRef, useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { QRCodeSVG } from 'qrcode.react';
-import { ShieldCheck, Download, Share2, QrCode, KeyRound, RefreshCw, Copy, Check } from 'lucide-react';
+import { ShieldCheck, Download, Share2, QrCode, KeyRound, RefreshCw, Copy, Check, ExternalLink, Globe, Wifi } from 'lucide-react';
 
 export const QRPass = () => {
   const { user, logActivity } = useAuth();
@@ -10,9 +11,22 @@ export const QRPass = () => {
   const [expiresAt, setExpiresAt] = useState<number | null>(null);
   const [copied, setCopied] = useState(false);
   const [generating, setGenerating] = useState(false);
+  const [lanIp, setLanIp] = useState<string | null>(null);
+  const [publicUrl, setPublicUrl] = useState<string | null>(null);
+  const [networkMode, setNetworkMode] = useState<'public' | 'lan'>('public');
 
   useEffect(() => {
     if (!user || user.role !== 'Patient') return;
+
+    // 1. Ensure current patient & medical records are synced to the backend database
+    // so scanning from any external mobile device (4G/5G or Wi-Fi) always finds this patient!
+    fetch(`/api/users/${encodeURIComponent(user.id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(user),
+    }).catch(() => {});
+
+    // 2. Fetch active OTP if one exists
     fetch(`/api/scan/otp/${encodeURIComponent(user.id)}`)
       .then((res) => (res.ok ? res.json() : Promise.reject()))
       .then((data: { active: boolean; otp?: string; expiresAt?: number }) => {
@@ -22,9 +36,41 @@ export const QRPass = () => {
         }
       })
       .catch(() => {});
+
+    // 3. Fetch Public HTTPS URL (for Mobile Data + Wi-Fi) and LAN IP
+    const currentPort = window.location.port || '5173';
+    const fetchNetworkInfo = () => {
+      fetch(`/api/network-info?port=${encodeURIComponent(currentPort)}`)
+        .then((res) => (res.ok ? res.json() : Promise.reject()))
+        .then((data: { lanIp?: string | null; publicUrl?: string | null }) => {
+          if (data.lanIp) setLanIp(data.lanIp);
+          if (data.publicUrl) setPublicUrl(data.publicUrl);
+        })
+        .catch(() => {});
+    };
+
+    fetchNetworkInfo();
+    const timer = setTimeout(fetchNetworkInfo, 2500);
+    return () => clearTimeout(timer);
   }, [user]);
 
   if (user?.role !== 'Patient') return null;
+
+  // Build a real, scannable URL that works on BOTH Mobile Data (via public HTTPS tunnel) and Wi-Fi (via Express port 5000)
+  const getBaseOrigin = () => {
+    const { protocol, hostname } = window.location;
+    if (hostname === 'localhost' || hostname === '127.0.0.1' || /^\d+\.\d+\.\d+\.\d+$/.test(hostname)) {
+      if (networkMode === 'public' && publicUrl) {
+        return publicUrl;
+      }
+      if (lanIp) {
+        return `${protocol}//${lanIp}:5000`;
+      }
+    }
+    return window.location.origin;
+  };
+
+  const qrScanUrl = `${getBaseOrigin()}/scan-result/2?id=${encodeURIComponent(user.id)}`;
 
   const generateOtp = () => {
     setGenerating(true);
@@ -62,12 +108,12 @@ export const QRPass = () => {
     const img = new Image();
 
     img.onload = () => {
-      canvas.width = img.width;
-      canvas.height = img.height;
+      canvas.width = img.width + 40;
+      canvas.height = img.height + 40;
       if (ctx) {
         ctx.fillStyle = 'white';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(img, 0, 0);
+        ctx.drawImage(img, 20, 20);
         const pngFile = canvas.toDataURL('image/png');
         const downloadLink = document.createElement('a');
         downloadLink.download = `medqr-pass-${user.id}.png`;
@@ -87,7 +133,7 @@ export const QRPass = () => {
         </div>
         <div>
           <h2 className="text-2xl font-bold text-gray-900">My QR Code</h2>
-          <p className="text-sm text-gray-500">Your secure, encrypted medical pass.</p>
+          <p className="text-sm text-gray-500">Works on both Mobile Data (4G/5G) and Wi-Fi networks.</p>
         </div>
       </div>
 
@@ -98,39 +144,77 @@ export const QRPass = () => {
             <div className="text-xs text-gray-400 font-mono">{user.id}</div>
           </div>
           <div className="bg-[#10B981] text-white px-3 py-1 rounded-full text-[10px] font-bold flex items-center gap-1 uppercase tracking-wider">
-            <ShieldCheck size={14} /> Active
+            <ShieldCheck size={14} /> Active (Mobile + Wi-Fi)
           </div>
         </div>
 
-        <div className="p-12 flex flex-col items-center justify-center bg-gray-50/50">
-          <div className="bg-white p-4 rounded-2xl shadow-sm border border-gray-100 mb-8 inline-block">
+        <div className="p-8 md:p-10 flex flex-col items-center justify-center bg-gray-50/50">
+          {/* Network Mode Selector */}
+          {publicUrl && lanIp && (
+            <div className="inline-flex bg-gray-200/80 p-1 rounded-xl mb-6 text-xs font-bold">
+              <button
+                type="button"
+                onClick={() => setNetworkMode('public')}
+                className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors ${
+                  networkMode === 'public' ? 'bg-white text-[#1e293b] shadow-sm' : 'text-gray-600'
+                }`}
+              >
+                <Globe size={14} className="text-[#10B981]" /> Mobile Data &amp; Wi-Fi (Global HTTPS)
+              </button>
+              <button
+                type="button"
+                onClick={() => setNetworkMode('lan')}
+                className={`px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors ${
+                  networkMode === 'lan' ? 'bg-white text-[#1e293b] shadow-sm' : 'text-gray-600'
+                }`}
+              >
+                <Wifi size={14} className="text-[#3B82F6]" /> Local Wi-Fi ({lanIp})
+              </button>
+            </div>
+          )}
+
+          <div className="bg-white p-5 rounded-2xl shadow-sm border border-gray-100 mb-6 inline-block">
             <QRCodeSVG
               ref={svgRef}
-              value={user.id}
+              value={qrScanUrl}
               size={240}
-              level="H"
-              includeMargin={false}
+              level="M"
+              includeMargin={true}
               fgColor="#1e293b"
             />
           </div>
 
           <h3 className="font-bold text-xl text-gray-900 mb-2">{user.name}</h3>
-          <p className="text-sm text-gray-500 max-w-sm mx-auto mb-8">
-            Present this QR code to verified medical personnel to grant them 3-tier encrypted access to your records.
+          <p className="text-sm text-gray-500 max-w-md mx-auto mb-3">
+            Scan this QR code with your phone camera (on <strong>Mobile Data</strong> or <strong>Wi-Fi</strong>) or the in-app scanner to immediately view your medical report.
           </p>
+          <a
+            href={qrScanUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="text-xs font-mono text-[#10B981] hover:underline bg-white px-3 py-1.5 rounded-lg border border-gray-200 mb-6 break-all max-w-md inline-block"
+          >
+            {qrScanUrl}
+          </a>
 
-          <div className="flex gap-4">
+          <div className="flex flex-wrap justify-center gap-3">
             <button
               onClick={downloadQR}
-              className="bg-[#10B981] hover:bg-[#059669] text-white px-6 py-3 rounded-lg text-sm font-bold flex items-center gap-2 shadow-sm transition-colors"
+              className="bg-[#10B981] hover:bg-[#059669] text-white px-5 py-3 rounded-lg text-sm font-bold flex items-center gap-2 shadow-sm transition-colors"
             >
               <Download size={18} /> Download PNG
             </button>
-            <button
-              onClick={() => navigator.clipboard?.writeText(user.id)}
-              className="bg-white hover:bg-gray-50 text-gray-700 border border-gray-200 px-6 py-3 rounded-lg text-sm font-bold flex items-center gap-2 shadow-sm transition-colors"
+            <Link
+              to={`/scan-result/2?id=${encodeURIComponent(user.id)}`}
+              className="bg-[#1e293b] hover:bg-[#0f172a] text-white px-5 py-3 rounded-lg text-sm font-bold flex items-center gap-2 shadow-sm transition-colors"
             >
-              <Share2 size={18} /> Copy Pass ID
+              <ExternalLink size={18} /> Open Medical Report
+            </Link>
+            <button
+              onClick={() => navigator.clipboard?.writeText(qrScanUrl)}
+              className="bg-white hover:bg-gray-50 text-gray-700 border border-gray-200 px-5 py-3 rounded-lg text-sm font-bold flex items-center gap-2 shadow-sm transition-colors"
+            >
+              <Share2 size={18} /> Copy Scan Link
             </button>
           </div>
         </div>
@@ -146,7 +230,7 @@ export const QRPass = () => {
             <div>
               <h3 className="font-bold text-gray-900 text-base">Tier-2 Vault Unlock OTP</h3>
               <p className="text-xs text-gray-500">
-                Generate a 6-digit One-Time Password to share with an external doctor or hospital to unlock your full medical records.
+                Generate a 6-digit One-Time Password to share with a hospital or doctor when they scan in Tier-3 mode.
               </p>
             </div>
           </div>
