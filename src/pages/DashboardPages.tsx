@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
+import { apiFetch } from '../utils/api';
 import { MapContainer, TileLayer, Marker, Popup, Polyline, CircleMarker, useMap } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import { ShieldCheck, Scan, Heart, Info, Calendar, Activity, User, QrCode, FileText, ArrowUpRight, Plus, X, Trash2, Send, Bot, Map, Users, KeyRound, Navigation, Phone, LocateFixed, Search } from 'lucide-react';
@@ -19,7 +20,7 @@ L.Marker.prototype.options.icon = DefaultIcon;
 
 // --- Dashboard Home ---
 export const Dashboard = () => {
-  const { user, getAllUsers, logActivity } = useAuth();
+  const { user, logActivity } = useAuth();
   const navigate = useNavigate();
   const [quickPatientId, setQuickPatientId] = useState('MQR-2026-12345');
   const [quickOtp, setQuickOtp] = useState('');
@@ -29,12 +30,22 @@ export const Dashboard = () => {
     const handleHospitalOtpUnlock = async (e: React.FormEvent) => {
       e.preventDefault();
       setQuickError('');
-      const found = getAllUsers().find(
-        (u) => u.id.toLowerCase() === quickPatientId.trim().toLowerCase() && u.role === 'Patient'
-      ) as Patient | undefined;
+      let found: Patient | undefined;
+
+      try {
+        const pRes = await apiFetch(`/api/users/${encodeURIComponent(quickPatientId.trim())}`);
+        if (pRes.ok) {
+          const pData = await pRes.json();
+          if (pData.user && pData.user.role === 'Patient') {
+            found = pData.user as Patient;
+          }
+        }
+      } catch {
+        // Ignore network error
+      }
 
       if (!found) {
-        setQuickError('Patient ID not found.');
+        setQuickError('Patient ID not found or unauthorized.');
         return;
       }
 
@@ -44,16 +55,16 @@ export const Dashboard = () => {
       }
 
       try {
-        const res = await fetch('/api/scan/verify-otp', {
+        const res = await apiFetch('/api/scan/verify-otp', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ patientId: found.id, otp: quickOtp.trim() }),
         });
         const data = await res.json();
-        if (!res.ok) {
+        if (!res.ok || !data.vaultToken) {
           setQuickError(data.error || 'Invalid 6-digit OTP code.');
           return;
         }
+        sessionStorage.setItem(`medqr_vault_token_${found.id.toLowerCase()}`, data.vaultToken);
         if (user) {
           logActivity(
             user.id,
@@ -640,10 +651,9 @@ export const AIAssistant = () => {
     setInput('');
     setIsTyping(true);
 
-    fetch('/api/ai/chat', {
+    apiFetch('/api/ai/chat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: userMessage, userId: user?.id }),
+      body: JSON.stringify({ message: userMessage }),
     })
       .then((res) => (res.ok ? res.json() : Promise.reject()))
       .then((data: { reply: string }) => {

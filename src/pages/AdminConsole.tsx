@@ -1,5 +1,6 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
+import { apiFetch } from '../utils/api';
 import type { Hospital } from '../types';
 import { Shield, CheckCircle, XCircle, LogOut } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
@@ -10,6 +11,17 @@ export const AdminConsole = () => {
   const [hospitals, setHospitals] = useState<Hospital[]>(
     getAllUsers().filter(u => u.role === 'Hospital') as Hospital[]
   );
+
+  useEffect(() => {
+    apiFetch('/api/users')
+      .then((res) => (res.ok ? res.json() : Promise.reject()))
+      .then((data: { users?: Hospital[] }) => {
+        if (Array.isArray(data.users)) {
+          setHospitals(data.users.filter((u) => u.role === 'Hospital') as Hospital[]);
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   const handleStatusChange = (hospitalId: string, status: 'verified' | 'rejected') => {
     const hospital = hospitals.find(h => h.id === hospitalId);

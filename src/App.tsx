@@ -12,7 +12,14 @@ import { ScanResult } from './pages/ScanResult';
 import { Dashboard, Profile, MedicalRecords, PatientsAccessed, ScanHistory, AIAssistant, MapView } from './pages/DashboardPages';
 
 const ProtectedRoute = ({ children, allowedRoles }: { children: React.ReactNode, allowedRoles?: string[] }) => {
-  const { user } = useAuth();
+  const { user, authLoading } = useAuth();
+  if (authLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-50 text-sm font-bold text-gray-500">
+        Verifying session...
+      </div>
+    );
+  }
   if (!user) return <Navigate to="/login" />;
   if (allowedRoles && !allowedRoles.includes(user.role)) return <Navigate to="/dashboard" />;
   

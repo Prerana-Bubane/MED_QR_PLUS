@@ -6,7 +6,7 @@ import { Shield } from 'lucide-react';
 
 export const Register = () => {
   const [role, setRole] = useState<'Patient' | 'Hospital'>('Patient');
-  const { registerPatient, registerHospital, login } = useAuth();
+  const { registerPatient, registerHospital } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -18,21 +18,34 @@ export const Register = () => {
   }, [location]);
 
   const [formData, setFormData] = useState<any>({});
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setFormData({ ...formData, [e.target.name]: e.target.value });
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setError('');
+    setSubmitting(true);
+
     if (role === 'Patient') {
-      registerPatient(formData);
-      login(formData.email, 'Patient');
-      navigate('/dashboard');
+      const result = await registerPatient(formData);
+      setSubmitting(false);
+      if (result.success) {
+        navigate('/dashboard');
+      } else {
+        setError(result.error || 'Failed to register patient account.');
+      }
     } else {
-      registerHospital(formData);
-      login(formData.email, 'Hospital');
-      navigate('/dashboard/pending');
+      const result = await registerHospital(formData);
+      setSubmitting(false);
+      if (result.success) {
+        navigate('/dashboard/pending');
+      } else {
+        setError(result.error || 'Failed to register hospital account.');
+      }
     }
   };
 
@@ -42,17 +55,24 @@ export const Register = () => {
         <Shield className="text-accent" size={32} fill="currentColor" />
         <span>MED<span className="text-accent">QR+</span></span>
       </Link>
-      
+
       <div className="bg-surface border border-border p-8 rounded-xl shadow-md w-full max-w-2xl">
         <h1 className="text-2xl text-center mb-6">Create Account</h1>
 
+        {error && <div className="bg-danger/10 text-danger p-3 rounded-md mb-4 text-sm font-medium">{error}</div>}
+
         <div className="flex gap-2 mb-6 bg-background p-1 rounded-lg w-full max-w-xs mx-auto">
-          {['Patient', 'Hospital'].map(r => (
+          {(['Patient', 'Hospital'] as const).map((r) => (
             <button
               key={r}
               type="button"
-              className={`flex-1 py-2 text-sm font-medium rounded-md transition-colors ${role === r ? 'bg-surface shadow-sm text-primary' : 'text-text-muted hover:text-text'}`}
-              onClick={() => setRole(r as any)}
+              className={`flex-1 py-2 text-sm font-medium rounded-md transition-colors ${
+                role === r ? 'bg-surface shadow-sm text-primary' : 'text-text-muted hover:text-text'
+              }`}
+              onClick={() => {
+                setRole(r);
+                setError('');
+              }}
             >
               {r}
             </button>
@@ -82,10 +102,19 @@ export const Register = () => {
                 <Input label="Department" name="department" onChange={handleInputChange} required />
               </>
             )}
-            <Input label="Password" name="password" type="password" required />
+            <Input
+              label="Password (min 6 characters)"
+              name="password"
+              type="password"
+              minLength={6}
+              onChange={handleInputChange}
+              required
+            />
           </div>
 
-          <Button type="submit" fullWidth className="mt-4">Register as {role}</Button>
+          <Button type="submit" fullWidth className="mt-4" disabled={submitting}>
+            {submitting ? 'Creating Account...' : `Register as ${role}`}
+          </Button>
         </form>
 
         <p className="text-center text-sm text-text-muted mt-6">
@@ -99,7 +128,7 @@ export const Register = () => {
 const Input = ({ label, ...props }: any) => (
   <div>
     <label className="block text-sm font-medium mb-1">{label}</label>
-    <input 
+    <input
       className="w-full border border-border rounded-md px-3 py-2 outline-none focus:border-accent"
       {...props}
     />

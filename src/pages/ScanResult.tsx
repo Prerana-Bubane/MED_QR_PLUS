@@ -1,74 +1,75 @@
 import React, { useState, useEffect } from 'react';
 import { useLocation, useParams, Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
+import { apiFetch } from '../utils/api';
 import type { Patient } from '../types';
 import { ShieldAlert, ShieldCheck, Lock, AlertTriangle, ArrowLeft, KeyRound, RefreshCw, CheckCircle2, FileText, Activity, Shield } from 'lucide-react';
 
 export const ScanResult = () => {
   const { tier } = useParams<{ tier: string }>();
   const location = useLocation();
-  const { user, getAllUsers, logActivity } = useAuth();
+  const { user, logActivity } = useAuth();
   const [patient, setPatient] = useState<Patient | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [notFound, setNotFound] = useState<boolean>(false);
   const [otp, setOtp] = useState('');
-  const [generatedOtp, setGeneratedOtp] = useState<string>('');
+  const [otpNotice, setOtpNotice] = useState<string>('');
   const [otpError, setOtpError] = useState<string>('');
   const [isRequesting, setIsRequesting] = useState(false);
-  const [accessLevel, setAccessLevel] = useState<string>(tier || '2');
+  const [accessLevel, setAccessLevel] = useState<string>('3');
 
   const queryParams = new URLSearchParams(location.search);
   const patientId = queryParams.get('id') || 'MQR-2026-12345';
+  const queryVaultToken = queryParams.get('vaultToken') || '';
 
-  useEffect(() => {
-    if (tier) {
-      setAccessLevel(tier);
-    }
-  }, [tier]);
+  const getVaultTokenKey = (id: string) => `medqr_vault_token_${id.toLowerCase()}`;
 
-  useEffect(() => {
+  const fetchPatientRecord = (overrideVaultToken?: string) => {
     setLoading(true);
     setNotFound(false);
 
-    const users = getAllUsers();
-    const localFound = users.find(
-      (u) => u.id.toLowerCase() === patientId.toLowerCase() && u.role === 'Patient'
-    ) as Patient | undefined;
+    const storedVaultToken =
+      overrideVaultToken ||
+      queryVaultToken ||
+      sessionStorage.getItem(getVaultTokenKey(patientId)) ||
+      '';
 
-    if (localFound) {
-      setPatient(localFound);
-      setLoading(false);
+    const headers: Record<string, string> = {};
+    if (storedVaultToken) {
+      headers['x-vault-token'] = storedVaultToken;
     }
 
-    // Fetch fresh patient record from backend API so scanning from any mobile/Wi-Fi device displays the report
-    fetch(`/api/users/${encodeURIComponent(patientId)}`)
+    apiFetch(`/api/users/${encodeURIComponent(patientId)}`, {
+      headers,
+    })
       .then((res) => (res.ok ? res.json() : Promise.reject()))
-      .then((data: { user?: Patient }) => {
+      .then((data: { user?: Patient; tierLocked?: boolean; accessTier?: string }) => {
         if (data.user && data.user.role === 'Patient') {
           setPatient(data.user);
+          // Server strictly decides whether Tier 2 is unlocked; never allow URL /scan-result/2 to bypass server lock
+          if (data.tierLocked === false && tier !== '3') {
+            setAccessLevel('2');
+          } else {
+            setAccessLevel('3');
+          }
           setLoading(false);
-        } else if (!localFound) {
+        } else {
           setNotFound(true);
           setLoading(false);
         }
       })
       .catch(() => {
-        if (!localFound) {
-          setNotFound(true);
-        }
+        setNotFound(true);
         setLoading(false);
       });
+  };
 
-    // Check if patient already generated an active OTP
-    fetch(`/api/scan/otp/${encodeURIComponent(patientId)}`)
-      .then((res) => (res.ok ? res.json() : Promise.reject()))
-      .then((data: { active: boolean; otp?: string }) => {
-        if (data.active && data.otp) {
-          setGeneratedOtp(data.otp);
-        }
-      })
-      .catch(() => {});
-  }, [patientId]);
+  useEffect(() => {
+    if (queryVaultToken) {
+      sessionStorage.setItem(getVaultTokenKey(patientId), queryVaultToken);
+    }
+    fetchPatientRecord(queryVaultToken || undefined);
+  }, [patientId, tier, queryVaultToken]);
 
   if (loading && !patient) {
     return (
@@ -89,15 +90,15 @@ export const ScanResult = () => {
           <div className="w-12 h-12 rounded-xl bg-red-50 text-red-500 flex items-center justify-center mx-auto mb-4">
             <ShieldAlert size={24} />
           </div>
-          <h2 className="text-xl font-bold text-gray-900 mb-2">Patient Record Not Found</h2>
+          <h2 className="text-xl font-bold text-gray-900 mb-2">Patient Record Not Accessible</h2>
           <p className="text-sm text-gray-500 mb-6">
-            Could not locate MedQR+ ID <span className="font-mono font-bold text-gray-800">{patientId}</span>.
+            Could not locate or authorize access to MedQR+ ID <span className="font-mono font-bold text-gray-800">{patientId}</span>. Please ensure you are signed in with an authorized account.
           </p>
           <Link
-            to="/"
+            to="/login"
             className="inline-flex items-center justify-center bg-[#1e293b] text-white px-6 py-2.5 rounded-lg text-sm font-bold"
           >
-            Go to MedQR+ Home
+            Sign In to MedQR+
           </Link>
         </div>
       </div>
@@ -106,25 +107,31 @@ export const ScanResult = () => {
 
   const handleRequestOtp = () => {
     setOtpError('');
+    setOtpNotice('');
     setIsRequesting(true);
 
-    fetch('/api/scan/request-otp', {
+    apiFetch('/api/scan/request-otp', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         patientId: patient.id,
         requestedBy: user?.name || 'Hospital Provider',
       }),
     })
-      .then((res) => (res.ok ? res.json() : Promise.reject()))
-      .then((data: { otp?: string; demoOtp?: string }) => {
-        const code = data.otp || data.demoOtp || '';
-        setGeneratedOtp(code);
+      .then(async (res) => {
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || 'Failed to request OTP');
+        }
+        return data as { message?: string };
+      })
+      .then((data) => {
+        setOtpNotice(
+          data.message || 'New 6-digit OTP generated. Ask the patient to share the code from their QR Pass.'
+        );
         setIsRequesting(false);
       })
-      .catch(() => {
-        const fallback = String(Math.floor(100000 + Math.random() * 900000));
-        setGeneratedOtp(fallback);
+      .catch((err: Error) => {
+        setOtpError(err.message || 'Could not request OTP.');
         setIsRequesting(false);
       });
   };
@@ -133,19 +140,20 @@ export const ScanResult = () => {
     e.preventDefault();
     setOtpError('');
 
-    fetch('/api/scan/verify-otp', {
+    apiFetch('/api/scan/verify-otp', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ patientId: patient.id, otp }),
     })
       .then(async (res) => {
         const data = await res.json();
-        if (!res.ok) {
+        if (!res.ok || !data.vaultToken) {
           throw new Error(data.error || 'Invalid OTP code');
         }
-        return data;
+        return data as { vaultToken: string };
       })
-      .then(() => {
+      .then((data) => {
+        sessionStorage.setItem(getVaultTokenKey(patient.id), data.vaultToken);
+        fetchPatientRecord(data.vaultToken);
         setAccessLevel('2');
         if (user?.role === 'Hospital') {
           logActivity(
@@ -158,12 +166,14 @@ export const ScanResult = () => {
         }
       })
       .catch((err: Error) => {
-        if (generatedOtp && otp.trim() === generatedOtp) {
-          setAccessLevel('2');
-        } else {
-          setOtpError(err.message || 'Invalid 6-digit OTP code. Please try again.');
-        }
+        setOtpError(err.message || 'Invalid 6-digit OTP code. Please try again.');
       });
+  };
+
+  const handleLockVault = () => {
+    sessionStorage.removeItem(getVaultTokenKey(patient.id));
+    setAccessLevel('3');
+    setPatient((prev) => (prev ? { ...prev, medicalRecords: [] } : prev));
   };
 
   const isFullAccess = accessLevel === '2' || accessLevel === '1';
@@ -178,15 +188,17 @@ export const ScanResult = () => {
           >
             <ArrowLeft size={16} /> {user ? 'Back to Dashboard' : 'MedQR+ Home'}
           </Link>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => setAccessLevel(isFullAccess ? '3' : '2')}
-              className="text-xs font-bold bg-white border border-gray-200 px-3 py-1.5 rounded-lg text-gray-600 hover:bg-gray-100 transition-colors"
-            >
-              Switch to {isFullAccess ? 'Tier 3 (OTP Locked View)' : 'Tier 2 (Full Report View)'}
-            </button>
-          </div>
+          {isFullAccess && (
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={handleLockVault}
+                className="text-xs font-bold bg-white border border-gray-200 px-3 py-1.5 rounded-lg text-gray-600 hover:bg-gray-100 transition-colors flex items-center gap-1.5"
+              >
+                <Lock size={13} /> Lock Vault (Return to Tier 3)
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Status Banner */}
@@ -304,27 +316,14 @@ export const ScanResult = () => {
                 </div>
                 <h2 className="text-xl font-bold text-gray-900 mb-2">Vault Locked (Tier 3 Restricted View)</h2>
                 <p className="text-gray-500 mb-6 max-w-md text-sm">
-                  Enter the <strong>6-Digit OTP</strong> shared by the patient (from their <em>My QR Code</em> screen), or click <strong>Send OTP to Patient</strong> to generate a new code.
+                  Enter the <strong>6-Digit OTP</strong> shared by the patient (from their <em>My QR Code</em> screen), or click <strong>Request Patient OTP</strong> to generate a new code on their pass.
                 </p>
 
                 <div className="w-full max-w-md mx-auto space-y-4">
-                  {generatedOtp && (
-                    <div className="bg-[#10B981]/10 border border-[#10B981]/30 rounded-[14px] p-4 text-left flex items-center justify-between">
-                      <div>
-                        <div className="text-[10px] font-bold uppercase tracking-wider text-[#059669] flex items-center gap-1">
-                          <CheckCircle2 size={12} /> Active Patient OTP Code
-                        </div>
-                        <div className="font-mono text-2xl font-bold tracking-[0.3em] text-[#1e293b] mt-1">
-                          {generatedOtp}
-                        </div>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => setOtp(generatedOtp)}
-                        className="bg-[#10B981] hover:bg-[#059669] text-white px-3 py-1.5 rounded-lg text-xs font-bold shadow-sm transition-colors"
-                      >
-                        Auto-Fill OTP
-                      </button>
+                  {otpNotice && (
+                    <div className="bg-[#10B981]/10 border border-[#10B981]/30 rounded-[14px] p-3.5 text-left text-xs font-bold text-[#059669] flex items-center gap-2">
+                      <CheckCircle2 size={16} className="shrink-0" />
+                      <span>{otpNotice}</span>
                     </div>
                   )}
 
@@ -343,7 +342,7 @@ export const ScanResult = () => {
                         className="text-xs font-bold text-[#3B82F6] hover:underline flex items-center gap-1"
                       >
                         <RefreshCw size={12} className={isRequesting ? 'animate-spin' : ''} />
-                        {generatedOtp ? 'Resend OTP' : 'Send OTP to Patient'}
+                        Request Patient OTP
                       </button>
                     </div>
 

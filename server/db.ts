@@ -17,7 +17,7 @@ export type StoredUser = User & {
 
 export interface DatabaseSchema {
   users: StoredUser[];
-  otpCodes: Record<string, { code: string; expiresAt: number }>;
+  otpCodes: Record<string, { code: string; expiresAt: number; attempts?: number }>;
 }
 
 const getInitialSeedUsers = (): StoredUser[] => {

@@ -2,6 +2,7 @@ import React, { useEffect, useState, useRef } from 'react';
 import { Html5QrcodeScanner, Html5Qrcode } from 'html5-qrcode';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
+import { apiFetch } from '../utils/api';
 import { Scan, ShieldAlert, KeyRound, Upload } from 'lucide-react';
 import type { Patient } from '../types';
 
@@ -12,7 +13,7 @@ export const Scanner = () => {
   const [scanningFile, setScanningFile] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const navigate = useNavigate();
-  const { user, getAllUsers, logActivity } = useAuth();
+  const { user, logActivity } = useAuth();
 
   // Extract Patient ID from either a full QR URL (http://.../scan-result/3?id=MQR-...) or raw ID string
   const extractPatientId = (rawText: string): string => {
@@ -53,24 +54,22 @@ export const Scanner = () => {
     setError('');
     const extractedId = extractPatientId(rawInput);
 
-    const users = getAllUsers();
-    let patient = users.find(
-      (u) => u.id.toLowerCase() === extractedId.toLowerCase() && u.role === 'Patient'
-    ) as Patient | undefined;
+    let patient: Patient | undefined;
 
-    // Also check backend API if not found in local cache
-    if (!patient) {
-      try {
-        const res = await fetch(`/api/users/${encodeURIComponent(extractedId)}`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.user && data.user.role === 'Patient') {
-            patient = data.user as Patient;
-          }
+    try {
+      const res = await apiFetch(`/api/users/${encodeURIComponent(extractedId)}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.user && data.user.role === 'Patient') {
+          patient = data.user as Patient;
         }
-      } catch {
-        // Ignore network error
+      } else if (res.status === 401 || res.status === 403) {
+        const errData = await res.json().catch(() => ({}));
+        setError(errData.error || 'Unauthorized to access this patient record.');
+        return;
       }
+    } catch {
+      // Ignore network error
     }
 
     if (!patient) {
@@ -83,16 +82,16 @@ export const Scanner = () => {
     // If the hospital entered a 6-digit OTP right here, verify it against the backend
     if (providedOtp && providedOtp.trim().length > 0) {
       try {
-        const res = await fetch('/api/scan/verify-otp', {
+        const res = await apiFetch('/api/scan/verify-otp', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ patientId: patient.id, otp: providedOtp.trim() }),
         });
         const data = await res.json();
-        if (!res.ok) {
+        if (!res.ok || !data.vaultToken) {
           setError(data.error || 'Invalid 6-digit OTP code.');
           return;
         }
+        sessionStorage.setItem(`medqr_vault_token_${patient.id.toLowerCase()}`, data.vaultToken);
         tier = '2';
       } catch {
         setError('Could not verify OTP. Please try again.');

@@ -18,6 +18,30 @@ export const signToken = (payload: JwtPayload): string => {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
 };
 
+export interface VaultTokenPayload {
+  type: 'tier2_vault';
+  patientId: string;
+}
+
+export const signVaultToken = (patientId: string): string => {
+  const payload: VaultTokenPayload = { type: 'tier2_vault', patientId };
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: '15m' });
+};
+
+export const verifyVaultToken = (token: string | undefined, patientId: string): boolean => {
+  if (!token || typeof token !== 'string') return false;
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET) as VaultTokenPayload;
+    return (
+      decoded.type === 'tier2_vault' &&
+      typeof decoded.patientId === 'string' &&
+      decoded.patientId.toLowerCase() === patientId.toLowerCase()
+    );
+  } catch {
+    return false;
+  }
+};
+
 export const authenticateToken = (req: AuthenticatedRequest, res: Response, next: NextFunction): void => {
   const authHeader = req.headers.authorization;
   const token = authHeader && authHeader.split(' ')[1];

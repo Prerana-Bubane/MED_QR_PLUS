@@ -1,6 +1,7 @@
 import { useRef, useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
+import { apiFetch } from '../utils/api';
 import { QRCodeSVG } from 'qrcode.react';
 import { ShieldCheck, Download, Share2, QrCode, KeyRound, RefreshCw, Copy, Check, ExternalLink, Globe, Wifi } from 'lucide-react';
 
@@ -19,15 +20,13 @@ export const QRPass = () => {
     if (!user || user.role !== 'Patient') return;
 
     // 1. Ensure current patient & medical records are synced to the backend database
-    // so scanning from any external mobile device (4G/5G or Wi-Fi) always finds this patient!
-    fetch(`/api/users/${encodeURIComponent(user.id)}`, {
+    apiFetch(`/api/users/${encodeURIComponent(user.id)}`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(user),
     }).catch(() => {});
 
     // 2. Fetch active OTP if one exists
-    fetch(`/api/scan/otp/${encodeURIComponent(user.id)}`)
+    apiFetch(`/api/scan/otp/${encodeURIComponent(user.id)}`)
       .then((res) => (res.ok ? res.json() : Promise.reject()))
       .then((data: { active: boolean; otp?: string; expiresAt?: number }) => {
         if (data.active && data.otp) {
@@ -40,7 +39,7 @@ export const QRPass = () => {
     // 3. Fetch Public HTTPS URL (for Mobile Data + Wi-Fi) and LAN IP
     const currentPort = window.location.port || '5173';
     const fetchNetworkInfo = () => {
-      fetch(`/api/network-info?port=${encodeURIComponent(currentPort)}`)
+      apiFetch(`/api/network-info?port=${encodeURIComponent(currentPort)}`)
         .then((res) => (res.ok ? res.json() : Promise.reject()))
         .then((data: { lanIp?: string | null; publicUrl?: string | null }) => {
           if (data.lanIp) setLanIp(data.lanIp);
@@ -70,25 +69,25 @@ export const QRPass = () => {
     return window.location.origin;
   };
 
-  const qrScanUrl = `${getBaseOrigin()}/scan-result/2?id=${encodeURIComponent(user.id)}`;
+  const qrScanUrl = `${getBaseOrigin()}/scan-result/3?id=${encodeURIComponent(user.id)}`;
 
   const generateOtp = () => {
     setGenerating(true);
-    fetch('/api/scan/request-otp', {
+    apiFetch('/api/scan/request-otp', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ patientId: user.id, requestedBy: 'Patient Self-Generation' }),
     })
       .then((res) => (res.ok ? res.json() : Promise.reject()))
-      .then((data: { otp: string; expiresAt: number }) => {
-        setActiveOtp(data.otp);
-        setExpiresAt(data.expiresAt);
+      .then(() => apiFetch(`/api/scan/otp/${encodeURIComponent(user.id)}`))
+      .then((res) => (res.ok ? res.json() : Promise.reject()))
+      .then((data: { active: boolean; otp?: string; expiresAt?: number }) => {
+        if (data.active && data.otp) {
+          setActiveOtp(data.otp);
+          setExpiresAt(data.expiresAt || null);
+        }
         setGenerating(false);
       })
       .catch(() => {
-        const fallbackCode = String(Math.floor(100000 + Math.random() * 900000));
-        setActiveOtp(fallbackCode);
-        setExpiresAt(Date.now() + 5 * 60 * 1000);
         setGenerating(false);
       });
   };
