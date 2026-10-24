@@ -355,6 +355,12 @@ export const Profile = () => {
   const [formData, setFormData] = useState<any>(user || {});
   const [isSaved, setIsSaved] = useState(false);
 
+  useEffect(() => {
+    if (user) {
+      setFormData(user);
+    }
+  }, [user]);
+
   if (!user) return null;
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
@@ -365,12 +371,14 @@ export const Profile = () => {
     setFormData({ ...formData, [e.target.name]: e.target.value.split(',').map(s => s.trim()).filter(s => s) });
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    updateUser(formData as any);
-    logActivity(user.id, 'profile_updated', 'Updated profile information.');
-    setIsSaved(true);
-    setTimeout(() => setIsSaved(false), 3000);
+    const updated = await updateUser({ ...formData, id: user.id });
+    if (updated) {
+      await logActivity(user.id, 'profile_updated', 'Updated profile information.');
+      setIsSaved(true);
+      setTimeout(() => setIsSaved(false), 3000);
+    }
   };
 
   return (

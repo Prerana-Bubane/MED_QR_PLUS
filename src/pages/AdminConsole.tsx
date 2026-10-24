@@ -6,11 +6,9 @@ import { Shield, CheckCircle, XCircle, LogOut } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 
 export const AdminConsole = () => {
-  const { getAllUsers, updateUser, user, logout } = useAuth();
+  const { updateUser, user, logout } = useAuth();
   const navigate = useNavigate();
-  const [hospitals, setHospitals] = useState<Hospital[]>(
-    getAllUsers().filter(u => u.role === 'Hospital') as Hospital[]
-  );
+  const [hospitals, setHospitals] = useState<Hospital[]>([]);
 
   useEffect(() => {
     apiFetch('/api/users')
@@ -23,12 +21,17 @@ export const AdminConsole = () => {
       .catch(() => {});
   }, []);
 
-  const handleStatusChange = (hospitalId: string, status: 'verified' | 'rejected') => {
-    const hospital = hospitals.find(h => h.id === hospitalId);
-    if (hospital) {
-      const updated = { ...hospital, status, verified: status === 'verified' };
-      updateUser(updated);
-      setHospitals(hospitals.map(h => h.id === hospitalId ? updated : h));
+  const handleStatusChange = async (hospitalId: string, status: 'verified' | 'rejected') => {
+    const updated = await updateUser({
+      id: hospitalId,
+      status,
+      verified: status === 'verified',
+    } as Partial<Hospital> & { id: string });
+
+    if (updated && updated.role === 'Hospital') {
+      setHospitals((prev) =>
+        prev.map((h) => (h.id === hospitalId ? (updated as Hospital) : h))
+      );
     }
   };
 

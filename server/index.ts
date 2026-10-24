@@ -1,10 +1,10 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import os from 'os';
 import { spawn, type ChildProcess } from 'child_process';
-import dotenv from 'dotenv';
 import { readDb, writeDb, sanitizeUser, type StoredUser } from './db.js';
 import {
   signToken,
@@ -15,12 +15,29 @@ import {
 } from './middleware/auth.js';
 import type { Patient, Hospital, ActivityLog, MedicalRecord, Role } from '../src/types/index.js';
 
-dotenv.config();
-
 const app = express();
 const PORT = Number(process.env.PORT) || 5000;
 
-app.use(cors());
+const ALLOWED_ORIGINS = (process.env.FRONTEND_ORIGIN || 'http://localhost:5173,http://127.0.0.1:5173')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow same-origin / non-browser requests (no Origin header) or explicitly whitelisted frontend origins
+      if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error('Not allowed by CORS'));
+      }
+    },
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-vault-token'],
+    credentials: true,
+  })
+);
 app.use(express.json());
 
 const getLocalNetworkIp = (): string | null => {
@@ -35,10 +52,12 @@ const getLocalNetworkIp = (): string | null => {
   return null;
 };
 
-// Manage a single public HTTPS tunnel to the Express server (127.0.0.1:5000) so QR codes work on BOTH Mobile Data (4G/5G) and Wi-Fi
+// Public SSH tunnel is strictly opt-in for local mobile testing (ENABLE_PUBLIC_TUNNEL=true) and never runs in production
+const isTunnelOptIn =
+  process.env.ENABLE_PUBLIC_TUNNEL === 'true' && process.env.NODE_ENV !== 'production';
 let publicTunnelUrl: string | null = null;
 let tunnelProc: ChildProcess | null = null;
-let tunnelDisabled = process.env.DISABLE_SSH_TUNNEL === 'true';
+let tunnelDisabled = !isTunnelOptIn;
 let tunnelRetryCount = 0;
 const MAX_TUNNEL_RETRIES = 3;
 
@@ -49,7 +68,7 @@ const startPublicTunnel = () => {
       'ssh',
       [
         '-o',
-        'StrictHostKeyChecking=no',
+        'StrictHostKeyChecking=accept-new',
         '-o',
         'ServerAliveInterval=30',
         '-R',
@@ -178,15 +197,22 @@ app.post('/api/auth/login', (req, res) => {
 
 // --- Auth: Register Patient ---
 app.post('/api/auth/register/patient', (req, res) => {
-  const data = req.body as Partial<Patient> & { password?: string };
+  const data = (req.body ?? {}) as Partial<Patient> & { password?: unknown };
 
-  if (!data.email || !data.name || !data.password) {
+  if (
+    typeof data.email !== 'string' ||
+    !data.email.trim() ||
+    typeof data.name !== 'string' ||
+    !data.name.trim() ||
+    typeof data.password !== 'string' ||
+    !data.password.trim()
+  ) {
     res.status(400).json({ error: 'Name, email, and password are required.' });
     return;
   }
 
-  if (data.password.length < 6) {
-    res.status(400).json({ error: 'Password must be at least 6 characters.' });
+  if (data.password.length < 8 || data.password.toLowerCase() === 'password123') {
+    res.status(400).json({ error: 'Password must be at least 8 characters and not a common default.' });
     return;
   }
 
@@ -197,7 +223,7 @@ app.post('/api/auth/register/patient', (req, res) => {
     return;
   }
 
-  const newId = data.id || `MQR-${new Date().getFullYear()}-${Math.floor(10000 + Math.random() * 90000)}`;
+  const newId = `MQR-${new Date().getFullYear()}-${Math.floor(10000 + Math.random() * 90000)}`;
   const passwordHash = bcrypt.hashSync(data.password, 10);
 
   const newPatient: StoredUser = {
@@ -241,15 +267,22 @@ app.post('/api/auth/register/patient', (req, res) => {
 
 // --- Auth: Register Hospital ---
 app.post('/api/auth/register/hospital', (req, res) => {
-  const data = req.body as Partial<Hospital> & { password?: string };
+  const data = (req.body ?? {}) as Partial<Hospital> & { password?: unknown };
 
-  if (!data.email || !data.name || !data.password) {
+  if (
+    typeof data.email !== 'string' ||
+    !data.email.trim() ||
+    typeof data.name !== 'string' ||
+    !data.name.trim() ||
+    typeof data.password !== 'string' ||
+    !data.password.trim()
+  ) {
     res.status(400).json({ error: 'Hospital name, email, and password are required.' });
     return;
   }
 
-  if (data.password.length < 6) {
-    res.status(400).json({ error: 'Password must be at least 6 characters.' });
+  if (data.password.length < 8 || data.password.toLowerCase() === 'password123') {
+    res.status(400).json({ error: 'Password must be at least 8 characters and not a common default.' });
     return;
   }
 
@@ -260,7 +293,7 @@ app.post('/api/auth/register/hospital', (req, res) => {
     return;
   }
 
-  const newId = data.id || `HOSP-${Math.floor(1000 + Math.random() * 9000)}`;
+  const newId = `HOSP-${Math.floor(1000 + Math.random() * 9000)}`;
   const passwordHash = bcrypt.hashSync(data.password, 10);
 
   const newHospital: StoredUser = {
@@ -420,7 +453,7 @@ app.put('/api/users/:id', authenticateToken, (req: AuthenticatedRequest, res) =>
     return;
   }
 
-  // Preserve immutable fields (id, role, passwordHash)
+  // Preserve immutable fields (id, role, passwordHash) and server-managed collections
   const updated: StoredUser = {
     ...existing,
     ...incoming,
@@ -429,10 +462,17 @@ app.put('/api/users/:id', authenticateToken, (req: AuthenticatedRequest, res) =>
     passwordHash: existing.passwordHash,
   } as StoredUser;
 
-  // Prevent non-Admins from self-verifying a Hospital account
-  if (existing.role === 'Hospital' && !isAdmin) {
-    (updated as Hospital).verified = existing.verified;
-    (updated as Hospital).status = existing.status;
+  if (existing.role === 'Patient') {
+    (updated as Patient).medicalRecords = existing.medicalRecords || [];
+    (updated as Patient).activityLog = existing.activityLog || [];
+  } else if (existing.role === 'Hospital') {
+    (updated as Hospital).patientsAccessed = existing.patientsAccessed || [];
+    (updated as Hospital).scanLogs = existing.scanLogs || [];
+    // Prevent non-Admins from self-verifying a Hospital account
+    if (!isAdmin) {
+      (updated as Hospital).verified = existing.verified;
+      (updated as Hospital).status = existing.status;
+    }
   }
 
   db.users[index] = updated;
@@ -1133,7 +1173,9 @@ app.get('/scan-result/:tier', (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   // Ensure DB is initialized and seeded on startup
   readDb();
-  startPublicTunnel();
+  if (isTunnelOptIn) {
+    startPublicTunnel();
+  }
   console.log(`✅ MedQR+ Backend Server running on http://0.0.0.0:${PORT}`);
 });
 

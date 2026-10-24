@@ -6,7 +6,7 @@ import { QRCodeSVG } from 'qrcode.react';
 import { ShieldCheck, Download, Share2, QrCode, KeyRound, RefreshCw, Copy, Check, ExternalLink, Globe, Wifi } from 'lucide-react';
 
 export const QRPass = () => {
-  const { user, logActivity } = useAuth();
+  const { user, refreshUser, logActivity } = useAuth();
   const svgRef = useRef<SVGSVGElement>(null);
   const [activeOtp, setActiveOtp] = useState<string>('');
   const [expiresAt, setExpiresAt] = useState<number | null>(null);
@@ -17,15 +17,13 @@ export const QRPass = () => {
   const [networkMode, setNetworkMode] = useState<'public' | 'lan'>('public');
 
   useEffect(() => {
+    refreshUser();
+  }, [refreshUser]);
+
+  useEffect(() => {
     if (!user || user.role !== 'Patient') return;
 
-    // 1. Ensure current patient & medical records are synced to the backend database
-    apiFetch(`/api/users/${encodeURIComponent(user.id)}`, {
-      method: 'PUT',
-      body: JSON.stringify(user),
-    }).catch(() => {});
-
-    // 2. Fetch active OTP if one exists
+    // 1. Fetch active OTP if one exists on the backend
     apiFetch(`/api/scan/otp/${encodeURIComponent(user.id)}`)
       .then((res) => (res.ok ? res.json() : Promise.reject()))
       .then((data: { active: boolean; otp?: string; expiresAt?: number }) => {

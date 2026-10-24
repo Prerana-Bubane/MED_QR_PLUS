@@ -103,10 +103,10 @@ export const Register = () => {
               </>
             )}
             <Input
-              label="Password (min 6 characters)"
+              label="Password (min 8 characters)"
               name="password"
               type="password"
-              minLength={6}
+              minLength={8}
               onChange={handleInputChange}
               required
             />

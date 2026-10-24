@@ -4,6 +4,11 @@ import { fileURLToPath } from 'url';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import type { User, Patient, Hospital, Admin } from '../src/types/index.js';
+import {
+  encryptUserForDisk,
+  decryptUserFromDisk,
+  type DiskUserRecord,
+} from './crypto.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,8 +25,25 @@ export interface DatabaseSchema {
   otpCodes: Record<string, { code: string; expiresAt: number; attempts?: number }>;
 }
 
+interface DiskDatabaseSchema {
+  encryptionVersion: 1;
+  users: DiskUserRecord[];
+  otpCodes: Record<string, { code: string; expiresAt: number; attempts?: number }>;
+}
+
+const getSeedPasswordHash = (envKey: string): string => {
+  const fromEnv = process.env[envKey]?.trim();
+  const rawPassword =
+    fromEnv && fromEnv.length >= 8 && fromEnv !== 'password123'
+      ? fromEnv
+      : crypto.randomBytes(16).toString('base64url');
+  return bcrypt.hashSync(rawPassword, 10);
+};
+
 const getInitialSeedUsers = (): StoredUser[] => {
-  const defaultPasswordHash = bcrypt.hashSync('password123', 10);
+  const adminPasswordHash = getSeedPasswordHash('SEED_ADMIN_PASSWORD');
+  const hospitalPasswordHash = getSeedPasswordHash('SEED_HOSPITAL_PASSWORD');
+  const patientPasswordHash = getSeedPasswordHash('SEED_PATIENT_PASSWORD');
 
   const admin: Admin & { passwordHash: string } = {
     id: 'ADMIN-001',
@@ -29,7 +51,7 @@ const getInitialSeedUsers = (): StoredUser[] => {
     name: 'System Admin',
     email: 'admin@medqr.com',
     phone: '123-456-7890',
-    passwordHash: defaultPasswordHash,
+    passwordHash: adminPasswordHash,
   };
 
   const dummyHospital: Hospital & { passwordHash: string } = {
@@ -65,7 +87,7 @@ const getInitialSeedUsers = (): StoredUser[] => {
         reason: 'Routine Emergency Checkup',
       },
     ],
-    passwordHash: defaultPasswordHash,
+    passwordHash: hospitalPasswordHash,
   };
 
   const dummyPatient: Patient & { passwordHash: string } = {
@@ -132,10 +154,26 @@ const getInitialSeedUsers = (): StoredUser[] => {
         details: 'Added new lab record: Comprehensive Metabolic Panel',
       },
     ],
-    passwordHash: defaultPasswordHash,
+    passwordHash: patientPasswordHash,
   };
 
   return [admin, dummyHospital, dummyPatient];
+};
+
+export const writeDb = (data: DatabaseSchema): void => {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    const diskPayload: DiskDatabaseSchema = {
+      encryptionVersion: 1,
+      users: data.users.map(encryptUserForDisk),
+      otpCodes: data.otpCodes || {},
+    };
+    fs.writeFileSync(DB_FILE, JSON.stringify(diskPayload, null, 2), 'utf-8');
+  } catch (error) {
+    console.error('Error writing encrypted database file:', error);
+  }
 };
 
 export const readDb = (): DatabaseSchema => {
@@ -148,28 +186,52 @@ export const readDb = (): DatabaseSchema => {
         users: getInitialSeedUsers(),
         otpCodes: {},
       };
-      fs.writeFileSync(DB_FILE, JSON.stringify(initialData, null, 2), 'utf-8');
+      writeDb(initialData);
       return initialData;
     }
+
     const raw = fs.readFileSync(DB_FILE, 'utf-8');
-    return JSON.parse(raw) as DatabaseSchema;
+    const parsedDisk = JSON.parse(raw) as Partial<DiskDatabaseSchema> & { users?: DiskUserRecord[] };
+
+    let needsWriteBack = parsedDisk.encryptionVersion !== 1;
+    const decryptedUsers: StoredUser[] = [];
+
+    for (const record of parsedDisk.users || []) {
+      const { user: u, wasPlaintext } = decryptUserFromDisk(record);
+      if (wasPlaintext) {
+        needsWriteBack = true;
+      }
+      if (!u.passwordHash || bcrypt.compareSync('password123', u.passwordHash)) {
+        const envKey =
+          u.role === 'Admin'
+            ? 'SEED_ADMIN_PASSWORD'
+            : u.role === 'Hospital'
+            ? 'SEED_HOSPITAL_PASSWORD'
+            : 'SEED_PATIENT_PASSWORD';
+        u.passwordHash = getSeedPasswordHash(envKey);
+        needsWriteBack = true;
+      }
+      decryptedUsers.push(u);
+    }
+
+    const schema: DatabaseSchema = {
+      users: decryptedUsers,
+      otpCodes: parsedDisk.otpCodes || {},
+    };
+
+    if (needsWriteBack) {
+      writeDb(schema);
+    }
+
+    return schema;
   } catch (error) {
     console.error('Error reading database file, falling back to seed data:', error);
-    return {
+    const fallback: DatabaseSchema = {
       users: getInitialSeedUsers(),
       otpCodes: {},
     };
-  }
-};
-
-export const writeDb = (data: DatabaseSchema): void => {
-  try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), 'utf-8');
-  } catch (error) {
-    console.error('Error writing database file:', error);
+    writeDb(fallback);
+    return fallback;
   }
 };
 

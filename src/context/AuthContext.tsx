@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, type ReactNode } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react';
 import type { User, Patient, Hospital, ActivityLog, MedicalRecord } from '../types';
 import { apiFetch, getAuthHeaders, TOKEN_KEY } from '../utils/api';
 
@@ -15,6 +15,7 @@ export interface AuthResult<T = User> {
 interface AuthContextType {
   user: User | null;
   authLoading: boolean;
+  refreshUser: () => Promise<User | null>;
   login: (
     email: string,
     password: string,
@@ -23,17 +24,16 @@ interface AuthContextType {
   logout: () => void;
   registerPatient: (data: Partial<Patient> & { password: string }) => Promise<AuthResult<Patient>>;
   registerHospital: (data: Partial<Hospital> & { password: string }) => Promise<AuthResult<Hospital>>;
-  getAllUsers: () => User[];
-  updateUser: (user: User) => void;
+  updateUser: (updates: Partial<User> & { id: string }) => Promise<User | null>;
   logActivity: (
     userId: string,
     type: ActivityLog['type'],
     details: string,
     extra?: Partial<ActivityLog>,
     scannedPatientId?: string
-  ) => void;
-  addMedicalRecord: (userId: string, record: Omit<MedicalRecord, 'id'>) => void;
-  deleteMedicalRecord: (userId: string, recordId: string) => void;
+  ) => Promise<void>;
+  addMedicalRecord: (userId: string, record: Omit<MedicalRecord, 'id'>) => Promise<void>;
+  deleteMedicalRecord: (userId: string, recordId: string) => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -55,25 +55,28 @@ const clearLegacyLocalStorage = () => {
 export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState<boolean>(true);
-  const [usersCache, setUsersCache] = useState<User[]>([]);
 
-  const refreshUsersList = async (currentRole?: string) => {
-    if (currentRole !== 'Admin') {
-      setUsersCache([]);
-      return;
+  const refreshUser = useCallback(async (): Promise<User | null> => {
+    const token = localStorage.getItem(TOKEN_KEY);
+    if (!token) {
+      setUser(null);
+      return null;
     }
+
     try {
-      const res = await apiFetch(`${API_BASE}/users`);
-      if (res.ok) {
-        const data: { users: User[] } = await res.json();
-        if (Array.isArray(data.users)) {
-          setUsersCache(data.users);
-        }
+      const res = await apiFetch(`${API_BASE}/auth/me`);
+      if (!res.ok) {
+        localStorage.removeItem(TOKEN_KEY);
+        setUser(null);
+        return null;
       }
+      const data: { user: User } = await res.json();
+      setUser(data.user);
+      return data.user;
     } catch {
-      // Ignore network error when fetching directory list
+      return null;
     }
-  };
+  }, []);
 
   useEffect(() => {
     clearLegacyLocalStorage();
@@ -96,7 +99,6 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       .then((data) => {
         setUser(data.user);
         setAuthLoading(false);
-        refreshUsersList(data.user.role);
       })
       .catch(() => {
         localStorage.removeItem(TOKEN_KEY);
@@ -104,11 +106,6 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         setAuthLoading(false);
       });
   }, []);
-
-  const getAllUsers = (): User[] => {
-    if (usersCache.length > 0) return usersCache;
-    return user ? [user] : [];
-  };
 
   const login = async (
     email: string,
@@ -134,7 +131,6 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       clearLegacyLocalStorage();
       localStorage.setItem(TOKEN_KEY, data.token);
       setUser(data.user);
-      await refreshUsersList(data.user.role);
 
       return { success: true, user: data.user };
     } catch {
@@ -147,7 +143,6 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
   const logout = () => {
     setUser(null);
-    setUsersCache([]);
     localStorage.removeItem(TOKEN_KEY);
     clearLegacyLocalStorage();
   };
@@ -172,7 +167,6 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       clearLegacyLocalStorage();
       localStorage.setItem(TOKEN_KEY, resp.token);
       setUser(resp.user);
-      await refreshUsersList(resp.user.role);
 
       return { success: true, user: resp.user };
     } catch {
@@ -203,7 +197,6 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       clearLegacyLocalStorage();
       localStorage.setItem(TOKEN_KEY, resp.token);
       setUser(resp.user);
-      await refreshUsersList(resp.user.role);
 
       return { success: true, user: resp.user };
     } catch {
@@ -214,75 +207,81 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     }
   };
 
-  const updateUser = (updatedUser: User) => {
-    apiFetch(`${API_BASE}/users/${encodeURIComponent(updatedUser.id)}`, {
-      method: 'PUT',
-      body: JSON.stringify(updatedUser),
-    })
-      .then((res) => (res.ok ? res.json() : Promise.reject()))
-      .then((data: { user: User }) => {
-        if (user?.id === data.user.id) {
-          setUser(data.user);
-        }
-        if (user?.role === 'Admin') {
-          setUsersCache((prev) =>
-            prev.map((u) => (u.id === data.user.id ? data.user : u))
-          );
-        }
-      })
-      .catch(() => {});
+  const updateUser = async (updates: Partial<User> & { id: string }): Promise<User | null> => {
+    try {
+      const res = await apiFetch(`${API_BASE}/users/${encodeURIComponent(updates.id)}`, {
+        method: 'PUT',
+        body: JSON.stringify(updates),
+      });
+      if (!res.ok) return null;
+      const data: { user: User } = await res.json();
+      setUser((prev) => (prev?.id === data.user.id ? data.user : prev));
+      return data.user;
+    } catch {
+      return null;
+    }
   };
 
-  const logActivity = (
+  const logActivity = async (
     userId: string,
     type: ActivityLog['type'],
     details: string,
     extra?: Partial<ActivityLog>,
     scannedPatientId?: string
-  ) => {
-    apiFetch(`${API_BASE}/users/${encodeURIComponent(userId)}/activity`, {
-      method: 'POST',
-      body: JSON.stringify({ type, details, extra, scannedPatientId }),
-    })
-      .then((res) => (res.ok ? res.json() : Promise.reject()))
-      .then((data: { user?: User }) => {
-        if (data.user && user?.id === data.user.id) {
-          setUser(data.user);
+  ): Promise<void> => {
+    try {
+      const res = await apiFetch(`${API_BASE}/users/${encodeURIComponent(userId)}/activity`, {
+        method: 'POST',
+        body: JSON.stringify({ type, details, extra, scannedPatientId }),
+      });
+      if (res.ok) {
+        const data: { user?: User } = await res.json();
+        if (data.user) {
+          setUser((prev) => (prev?.id === data.user!.id ? data.user! : prev));
         }
-      })
-      .catch(() => {});
+      }
+    } catch {
+      // Ignore activity log failure
+    }
   };
 
-  const addMedicalRecord = (userId: string, record: Omit<MedicalRecord, 'id'>) => {
-    const newRecord: MedicalRecord = {
-      ...record,
-      id: crypto.randomUUID(),
-    };
-
-    apiFetch(`${API_BASE}/users/${encodeURIComponent(userId)}/records`, {
-      method: 'POST',
-      body: JSON.stringify(newRecord),
-    })
-      .then((res) => (res.ok ? res.json() : Promise.reject()))
-      .then((data: { user?: User }) => {
-        if (data.user && user?.id === data.user.id) {
-          setUser(data.user);
+  const addMedicalRecord = async (
+    userId: string,
+    record: Omit<MedicalRecord, 'id'>
+  ): Promise<void> => {
+    try {
+      const res = await apiFetch(`${API_BASE}/users/${encodeURIComponent(userId)}/records`, {
+        method: 'POST',
+        body: JSON.stringify(record),
+      });
+      if (res.ok) {
+        const data: { user?: User } = await res.json();
+        if (data.user) {
+          setUser((prev) => (prev?.id === data.user!.id ? data.user! : prev));
         }
-      })
-      .catch(() => {});
+      }
+    } catch {
+      // Ignore network error
+    }
   };
 
-  const deleteMedicalRecord = (userId: string, recordId: string) => {
-    apiFetch(`${API_BASE}/users/${encodeURIComponent(userId)}/records/${encodeURIComponent(recordId)}`, {
-      method: 'DELETE',
-    })
-      .then((res) => (res.ok ? res.json() : Promise.reject()))
-      .then((data: { user?: User }) => {
-        if (data.user && user?.id === data.user.id) {
-          setUser(data.user);
+  const deleteMedicalRecord = async (userId: string, recordId: string): Promise<void> => {
+    try {
+      const res = await apiFetch(
+        `${API_BASE}/users/${encodeURIComponent(userId)}/records/${encodeURIComponent(recordId)}`,
+        {
+          method: 'DELETE',
         }
-      })
-      .catch(() => {});
+      );
+      if (res.ok) {
+        const data: { user?: User } = await res.json();
+        if (data.user) {
+          setUser((prev) => (prev?.id === data.user!.id ? data.user! : prev));
+        }
+      }
+    } catch {
+      // Ignore network error
+    }
   };
 
   return (
@@ -290,11 +289,11 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       value={{
         user,
         authLoading,
+        refreshUser,
         login,
         logout,
         registerPatient,
         registerHospital,
-        getAllUsers,
         updateUser,
         logActivity,
         addMedicalRecord,

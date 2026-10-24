@@ -1,8 +1,14 @@
+import 'dotenv/config';
 import type { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import type { Role } from '../../src/types/index.js';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'medqr-plus-dev-secret-key-2026';
+// Require JWT_SECRET environment variable on startup (no hard-coded fallback)
+const JWT_SECRET = process.env.JWT_SECRET?.trim();
+if (!JWT_SECRET) {
+  console.error('FATAL: JWT_SECRET environment variable is required and not set.');
+  process.exit(1);
+}
 
 export interface JwtPayload {
   id: string;
