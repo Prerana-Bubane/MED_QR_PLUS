@@ -30,22 +30,22 @@ export const Register = () => {
     setError('');
     setSubmitting(true);
 
-    if (role === 'Patient') {
-      const result = await registerPatient(formData);
-      setSubmitting(false);
-      if (result.success) {
-        navigate('/dashboard');
-      } else {
-        setError(result.error || 'Failed to register patient account.');
-      }
+    const result =
+      role === 'Patient'
+        ? await registerPatient(formData)
+        : await registerHospital(formData);
+
+    setSubmitting(false);
+
+    if (!result.success || !result.user) {
+      setError(result.error || `Failed to register ${role.toLowerCase()} account.`);
+      return;
+    }
+
+    if (result.user.role === 'Hospital' && !(result.user as any).verified) {
+      navigate('/dashboard/pending');
     } else {
-      const result = await registerHospital(formData);
-      setSubmitting(false);
-      if (result.success) {
-        navigate('/dashboard/pending');
-      } else {
-        setError(result.error || 'Failed to register hospital account.');
-      }
+      navigate('/dashboard');
     }
   };
 
@@ -59,7 +59,11 @@ export const Register = () => {
       <div className="bg-surface border border-border p-8 rounded-xl shadow-md w-full max-w-2xl">
         <h1 className="text-2xl text-center mb-6">Create Account</h1>
 
-        {error && <div className="bg-danger/10 text-danger p-3 rounded-md mb-4 text-sm font-medium">{error}</div>}
+        {error && (
+          <div role="alert" className="bg-danger/10 text-danger p-3 rounded-md mb-4 text-sm font-medium">
+            {error}
+          </div>
+        )}
 
         <div className="flex gap-2 mb-6 bg-background p-1 rounded-lg w-full max-w-xs mx-auto">
           {(['Patient', 'Hospital'] as const).map((r) => (
@@ -83,23 +87,23 @@ export const Register = () => {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {role === 'Patient' ? (
               <>
-                <Input label="Full Name" name="name" onChange={handleInputChange} required />
-                <Input label="Email" name="email" type="email" onChange={handleInputChange} required />
-                <Input label="Phone" name="phone" onChange={handleInputChange} required />
-                <Input label="Date of Birth" name="dob" type="date" onChange={handleInputChange} required />
-                <Input label="Gender" name="gender" onChange={handleInputChange} required />
-                <Input label="Blood Group" name="bloodGroup" onChange={handleInputChange} required />
-                <Input label="Address" name="address" onChange={handleInputChange} required />
+                <Input label="Full Name" name="name" value={formData.name || ''} onChange={handleInputChange} required />
+                <Input label="Email" name="email" type="email" value={formData.email || ''} onChange={handleInputChange} required />
+                <Input label="Phone" name="phone" value={formData.phone || ''} onChange={handleInputChange} required />
+                <Input label="Date of Birth" name="dob" type="date" value={formData.dob || ''} onChange={handleInputChange} required />
+                <Input label="Gender" name="gender" value={formData.gender || ''} onChange={handleInputChange} required />
+                <Input label="Blood Group" name="bloodGroup" value={formData.bloodGroup || ''} onChange={handleInputChange} required />
+                <Input label="Address" name="address" value={formData.address || ''} onChange={handleInputChange} required />
               </>
             ) : (
               <>
-                <Input label="Hospital Name" name="name" onChange={handleInputChange} required />
-                <Input label="Email" name="email" type="email" onChange={handleInputChange} required />
-                <Input label="Phone" name="phone" onChange={handleInputChange} required />
-                <Input label="License Number" name="licenseNumber" onChange={handleInputChange} required />
-                <Input label="Address" name="address" onChange={handleInputChange} required />
-                <Input label="Contact Person" name="contactPerson" onChange={handleInputChange} required />
-                <Input label="Department" name="department" onChange={handleInputChange} required />
+                <Input label="Hospital Name" name="name" value={formData.name || ''} onChange={handleInputChange} required />
+                <Input label="Email" name="email" type="email" value={formData.email || ''} onChange={handleInputChange} required />
+                <Input label="Phone" name="phone" value={formData.phone || ''} onChange={handleInputChange} required />
+                <Input label="License Number" name="licenseNumber" value={formData.licenseNumber || ''} onChange={handleInputChange} required />
+                <Input label="Address" name="address" value={formData.address || ''} onChange={handleInputChange} required />
+                <Input label="Contact Person" name="contactPerson" value={formData.contactPerson || ''} onChange={handleInputChange} required />
+                <Input label="Department" name="department" value={formData.department || ''} onChange={handleInputChange} required />
               </>
             )}
             <Input
@@ -107,6 +111,7 @@ export const Register = () => {
               name="password"
               type="password"
               minLength={8}
+              value={formData.password || ''}
               onChange={handleInputChange}
               required
             />

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { apiFetch } from '../utils/api';
+import { API_BASE, apiFetch } from '../utils/api';
 import type { Hospital } from '../types';
 import { Shield, CheckCircle, XCircle, LogOut } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
@@ -11,7 +11,7 @@ export const AdminConsole = () => {
   const [hospitals, setHospitals] = useState<Hospital[]>([]);
 
   useEffect(() => {
-    apiFetch('/api/users')
+    apiFetch(`${API_BASE}/users`)
       .then((res) => (res.ok ? res.json() : Promise.reject()))
       .then((data: { users?: Hospital[] }) => {
         if (Array.isArray(data.users)) {

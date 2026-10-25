@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: medqr-plus-backend
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm run start
+    healthCheckPath: /api/health
+    disk:
+      name: medqr-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5000
+      - key: DATA_DIR
+        value: /var/data
+      - key: ENABLE_PUBLIC_TUNNEL
+        value: "false"
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DATA_ENCRYPTION_KEY
+        generateValue: true
+      - key: FRONTEND_ORIGIN
+        sync: false

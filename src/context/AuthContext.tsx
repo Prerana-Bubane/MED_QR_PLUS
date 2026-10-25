@@ -1,10 +1,8 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react';
 import type { User, Patient, Hospital, ActivityLog, MedicalRecord } from '../types';
-import { apiFetch, getAuthHeaders, TOKEN_KEY } from '../utils/api';
+import { API_BASE, apiFetch, getAuthHeaders, TOKEN_KEY } from '../utils/api';
 
-export { apiFetch, getAuthHeaders };
-
-const API_BASE = import.meta.env.VITE_API_URL || '/api';
+export { API_BASE, apiFetch, getAuthHeaders };
 
 export interface AuthResult<T = User> {
   success: boolean;
@@ -22,8 +20,12 @@ interface AuthContextType {
     role: 'Patient' | 'Hospital' | 'Admin'
   ) => Promise<AuthResult<User>>;
   logout: () => void;
-  registerPatient: (data: Partial<Patient> & { password: string }) => Promise<AuthResult<Patient>>;
-  registerHospital: (data: Partial<Hospital> & { password: string }) => Promise<AuthResult<Hospital>>;
+  registerPatient: (
+    data: Omit<Partial<Patient>, 'id' | 'role'> & { password: string }
+  ) => Promise<AuthResult<Patient>>;
+  registerHospital: (
+    data: Omit<Partial<Hospital>, 'id' | 'role'> & { password: string }
+  ) => Promise<AuthResult<Hospital>>;
   updateUser: (updates: Partial<User> & { id: string }) => Promise<User | null>;
   logActivity: (
     userId: string,
@@ -148,12 +150,13 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   };
 
   const registerPatient = async (
-    data: Partial<Patient> & { password: string }
+    data: Omit<Partial<Patient>, 'id' | 'role'> & { password: string }
   ): Promise<AuthResult<Patient>> => {
     try {
+      const { id: _id, role: _role, ...payload } = data as Partial<Patient> & { password: string };
       const res = await apiFetch(`${API_BASE}/auth/register/patient`, {
         method: 'POST',
-        body: JSON.stringify(data),
+        body: JSON.stringify(payload),
       });
 
       const resp = await res.json().catch(() => ({}));
@@ -178,12 +181,13 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   };
 
   const registerHospital = async (
-    data: Partial<Hospital> & { password: string }
+    data: Omit<Partial<Hospital>, 'id' | 'role'> & { password: string }
   ): Promise<AuthResult<Hospital>> => {
     try {
+      const { id: _id, role: _role, ...payload } = data as Partial<Hospital> & { password: string };
       const res = await apiFetch(`${API_BASE}/auth/register/hospital`, {
         method: 'POST',
-        body: JSON.stringify(data),
+        body: JSON.stringify(payload),
       });
 
       const resp = await res.json().catch(() => ({}));

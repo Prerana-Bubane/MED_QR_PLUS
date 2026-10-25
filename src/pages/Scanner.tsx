@@ -2,18 +2,18 @@ import React, { useEffect, useState, useRef } from 'react';
 import { Html5QrcodeScanner, Html5Qrcode } from 'html5-qrcode';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
-import { apiFetch } from '../utils/api';
+import { API_BASE, apiFetch } from '../utils/api';
 import { Scan, ShieldAlert, KeyRound, Upload } from 'lucide-react';
 import type { Patient } from '../types';
 
 export const Scanner = () => {
-  const [manualId, setManualId] = useState('MQR-2026-12345');
+  const [manualId, setManualId] = useState('');
   const [otp, setOtp] = useState('');
   const [error, setError] = useState('');
   const [scanningFile, setScanningFile] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const navigate = useNavigate();
-  const { user, logActivity } = useAuth();
+  const { user, refreshUser, logActivity } = useAuth();
 
   // Extract Patient ID from either a full QR URL (http://.../scan-result/3?id=MQR-...) or raw ID string
   const extractPatientId = (rawText: string): string => {
@@ -57,7 +57,7 @@ export const Scanner = () => {
     let patient: Patient | undefined;
 
     try {
-      const res = await apiFetch(`/api/users/${encodeURIComponent(extractedId)}`);
+      const res = await apiFetch(`${API_BASE}/users/${encodeURIComponent(extractedId)}`);
       if (res.ok) {
         const data = await res.json();
         if (data.user && data.user.role === 'Patient') {
@@ -78,11 +78,12 @@ export const Scanner = () => {
     }
 
     let tier = '3';
+    let serverAuditLogged = false;
 
     // If the hospital entered a 6-digit OTP right here, verify it against the backend
     if (providedOtp && providedOtp.trim().length > 0) {
       try {
-        const res = await apiFetch('/api/scan/verify-otp', {
+        const res = await apiFetch(`${API_BASE}/scan/verify-otp`, {
           method: 'POST',
           body: JSON.stringify({ patientId: patient.id, otp: providedOtp.trim() }),
         });
@@ -92,6 +93,7 @@ export const Scanner = () => {
           return;
         }
         sessionStorage.setItem(`medqr_vault_token_${patient.id.toLowerCase()}`, data.vaultToken);
+        serverAuditLogged = Boolean(data.auditLogged);
         tier = '2';
       } catch {
         setError('Could not verify OTP. Please try again.');
@@ -102,13 +104,19 @@ export const Scanner = () => {
     }
 
     if (user?.role === 'Hospital') {
-      logActivity(
-        user.id,
-        'tier_scan',
-        `Scanned patient ${patient.name} (${patient.id}) — Tier ${tier}`,
-        { accessTier: `Tier ${tier}` as any, reason: tier === '2' ? 'OTP Verified Access' : 'Emergency Scan' },
-        patient.id
-      );
+      const scanMarkerKey = `medqr_scan_logged_${user.id.toLowerCase()}_${patient.id.toLowerCase()}_${tier}`;
+      sessionStorage.setItem(scanMarkerKey, '1');
+      if (serverAuditLogged) {
+        refreshUser();
+      } else {
+        logActivity(
+          user.id,
+          'tier_scan',
+          `Scanned patient ${patient.name} (${patient.id}) — Tier ${tier}`,
+          { accessTier: `Tier ${tier}` as any, reason: tier === '2' ? 'OTP Verified Access' : 'Emergency Scan' },
+          patient.id
+        );
+      }
     }
 
     navigate(`/scan-result/${tier}?id=${encodeURIComponent(patient.id)}`);

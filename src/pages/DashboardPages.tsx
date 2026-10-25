@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
-import { apiFetch } from '../utils/api';
+import { API_BASE, apiFetch } from '../utils/api';
 import { MapContainer, TileLayer, Marker, Popup, Polyline, CircleMarker, useMap } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import { ShieldCheck, Scan, Heart, Info, Calendar, Activity, User, QrCode, FileText, ArrowUpRight, Plus, X, Trash2, Send, Bot, Map, Users, KeyRound, Navigation, Phone, LocateFixed, Search } from 'lucide-react';
@@ -33,7 +33,7 @@ export const Dashboard = () => {
       let found: Patient | undefined;
 
       try {
-        const pRes = await apiFetch(`/api/users/${encodeURIComponent(quickPatientId.trim())}`);
+        const pRes = await apiFetch(`${API_BASE}/users/${encodeURIComponent(quickPatientId.trim())}`);
         if (pRes.ok) {
           const pData = await pRes.json();
           if (pData.user && pData.user.role === 'Patient') {
@@ -55,7 +55,7 @@ export const Dashboard = () => {
       }
 
       try {
-        const res = await apiFetch('/api/scan/verify-otp', {
+        const res = await apiFetch(`${API_BASE}/scan/verify-otp`, {
           method: 'POST',
           body: JSON.stringify({ patientId: found.id, otp: quickOtp.trim() }),
         });
@@ -659,7 +659,7 @@ export const AIAssistant = () => {
     setInput('');
     setIsTyping(true);
 
-    apiFetch('/api/ai/chat', {
+    apiFetch(`${API_BASE}/ai/chat`, {
       method: 'POST',
       body: JSON.stringify({ message: userMessage }),
     })

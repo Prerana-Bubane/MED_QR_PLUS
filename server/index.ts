@@ -5,7 +5,23 @@ import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import os from 'os';
 import { spawn, type ChildProcess } from 'child_process';
-import { readDb, writeDb, sanitizeUser, type StoredUser } from './db.js';
+import {
+  runInTransaction,
+  getUserById,
+  getUserByLogin,
+  userEmailExists,
+  userIdExists,
+  getAllUsers,
+  getUsersCount,
+  insertUser,
+  saveUser,
+  getOtpCode,
+  upsertOtpCode,
+  incrementOtpAttempts,
+  deleteOtpCode,
+  sanitizeUser,
+  type StoredUser,
+} from './db.js';
 import {
   signToken,
   signVaultToken,
@@ -13,7 +29,33 @@ import {
   authenticateToken,
   type AuthenticatedRequest,
 } from './middleware/auth.js';
-import type { Patient, Hospital, ActivityLog, MedicalRecord, Role } from '../src/types/index.js';
+import {
+  loginRateLimiter,
+  registerRateLimiter,
+  otpRequestRateLimiter,
+  otpVerifyRateLimiter,
+  otpStatusRateLimiter,
+} from './middleware/rateLimit.js';
+import {
+  validateBody,
+  validateParams,
+  validateQuery,
+  userIdParamSchema,
+  patientIdParamSchema,
+  deleteRecordParamSchema,
+  scanResultParamSchema,
+  scanResultQuerySchema,
+  loginBodySchema,
+  registerPatientBodySchema,
+  registerHospitalBodySchema,
+  updateUserBodySchema,
+  addMedicalRecordBodySchema,
+  logActivityBodySchema,
+  requestOtpBodySchema,
+  verifyOtpBodySchema,
+  aiChatBodySchema,
+} from './validation.js';
+import type { Patient, Hospital, ActivityLog, MedicalRecord } from '../src/types/index.js';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 5000;
@@ -138,13 +180,12 @@ app.get('/api/network-info', (_req, res) => {
 
 // --- Health Check ---
 app.get('/api/health', (_req, res) => {
-  const db = readDb();
   const lanIp = getLocalNetworkIp();
   res.json({
     status: 'ok',
-    service: 'MedQR+ Backend API',
+    service: 'MedQR+ Backend API (SQLite)',
     timestamp: new Date().toISOString(),
-    usersCount: db.users.length,
+    usersCount: getUsersCount(),
     lanIp,
     lanUrl: lanIp ? `http://${lanIp}:${PORT}` : null,
     publicUrl: publicTunnelUrl,
@@ -152,31 +193,14 @@ app.get('/api/health', (_req, res) => {
 });
 
 // --- Auth: Login (Strict Backend Password Verification — No Demo Bypasses) ---
-app.post('/api/auth/login', (req, res) => {
-  const { email, password, role } = (req.body ?? {}) as {
-    email?: unknown;
-    password?: unknown;
-    role?: unknown;
+app.post('/api/auth/login', loginRateLimiter, validateBody(loginBodySchema), (req, res) => {
+  const { email, password, role } = req.body as {
+    email: string;
+    password: string;
+    role: 'Patient' | 'Hospital' | 'Admin';
   };
 
-  if (
-    typeof email !== 'string' ||
-    !email.trim() ||
-    typeof password !== 'string' ||
-    password.length === 0 ||
-    (role !== 'Patient' && role !== 'Hospital' && role !== 'Admin')
-  ) {
-    res.status(400).json({ error: 'Email, password, and a valid role are required.' });
-    return;
-  }
-
-  const normalizedEmail = email.trim().toLowerCase();
-  const db = readDb();
-  const foundUser = db.users.find(
-    (u) =>
-      (u.email.toLowerCase() === normalizedEmail || u.id.toLowerCase() === normalizedEmail) &&
-      u.role === role
-  );
+  const foundUser = getUserByLogin(email, role);
 
   if (!foundUser || typeof foundUser.passwordHash !== 'string' || !foundUser.passwordHash) {
     res.status(401).json({ error: 'Invalid credentials or account does not exist.' });
@@ -195,128 +219,108 @@ app.post('/api/auth/login', (req, res) => {
   res.json({ token, user: safeUser });
 });
 
+const generateUniqueUserId = (prefix: string, digits = 5): string => {
+  const min = Math.pow(10, digits - 1);
+  const max = Math.pow(10, digits);
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const candidate = `${prefix}-${crypto.randomInt(min, max)}`;
+    if (!userIdExists(candidate)) {
+      return candidate;
+    }
+  }
+  return `${prefix}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+};
+
 // --- Auth: Register Patient ---
-app.post('/api/auth/register/patient', (req, res) => {
-  const data = (req.body ?? {}) as Partial<Patient> & { password?: unknown };
+app.post('/api/auth/register/patient', registerRateLimiter, validateBody(registerPatientBodySchema), (req, res) => {
+  const data = req.body as Omit<Partial<Patient>, 'id' | 'role'> & { password: string; name: string; email: string };
+  const passwordHash = bcrypt.hashSync(data.password, 10);
 
-  if (
-    typeof data.email !== 'string' ||
-    !data.email.trim() ||
-    typeof data.name !== 'string' ||
-    !data.name.trim() ||
-    typeof data.password !== 'string' ||
-    !data.password.trim()
-  ) {
-    res.status(400).json({ error: 'Name, email, and password are required.' });
-    return;
-  }
+  const createdPatient = runInTransaction(() => {
+    if (userEmailExists(data.email)) {
+      return null;
+    }
+    const newId = generateUniqueUserId(`MQR-${new Date().getFullYear()}`, 5);
+    const newPatient: StoredUser = {
+      id: newId,
+      role: 'Patient',
+      name: data.name.trim(),
+      email: data.email.trim(),
+      phone: data.phone || '',
+      dob: data.dob || '',
+      gender: data.gender || '',
+      bloodGroup: data.bloodGroup || '',
+      height: data.height || '',
+      weight: data.weight || '',
+      address: data.address || '',
+      allergies: Array.isArray(data.allergies) ? data.allergies : [],
+      chronicConditions: Array.isArray(data.chronicConditions) ? data.chronicConditions : [],
+      currentMedications: Array.isArray(data.currentMedications) ? data.currentMedications : [],
+      issuingHospital: data.issuingHospital || 'City General Hospital',
+      emergencyContact: data.emergencyContact || { name: '', relation: '', phone: '' },
+      insurance: data.insurance || { provider: '', policy: '', validUntil: '' },
+      medicalRecords: [],
+      activityLog: [
+        {
+          id: crypto.randomUUID(),
+          type: 'account_created',
+          date: new Date().toISOString(),
+          details: 'Account successfully registered.',
+        },
+      ],
+      passwordHash,
+    };
+    insertUser(newPatient);
+    return newPatient;
+  });
 
-  if (data.password.length < 8 || data.password.toLowerCase() === 'password123') {
-    res.status(400).json({ error: 'Password must be at least 8 characters and not a common default.' });
-    return;
-  }
-
-  const db = readDb();
-  const exists = db.users.some((u) => u.email.toLowerCase() === data.email!.trim().toLowerCase());
-  if (exists) {
+  if (!createdPatient) {
     res.status(409).json({ error: 'An account with this email already exists.' });
     return;
   }
 
-  const newId = `MQR-${new Date().getFullYear()}-${Math.floor(10000 + Math.random() * 90000)}`;
-  const passwordHash = bcrypt.hashSync(data.password, 10);
-
-  const newPatient: StoredUser = {
-    id: newId,
-    role: 'Patient',
-    name: data.name.trim(),
-    email: data.email.trim(),
-    phone: data.phone || '',
-    dob: data.dob || '',
-    gender: data.gender || '',
-    bloodGroup: data.bloodGroup || '',
-    height: data.height || '',
-    weight: data.weight || '',
-    address: data.address || '',
-    allergies: Array.isArray(data.allergies) ? data.allergies : [],
-    chronicConditions: Array.isArray(data.chronicConditions) ? data.chronicConditions : [],
-    currentMedications: Array.isArray(data.currentMedications) ? data.currentMedications : [],
-    issuingHospital: data.issuingHospital || 'City General Hospital',
-    emergencyContact: data.emergencyContact || { name: '', relation: '', phone: '' },
-    insurance: data.insurance || { provider: '', policy: '', validUntil: '' },
-    medicalRecords: [],
-    activityLog: [
-      {
-        id: crypto.randomUUID(),
-        type: 'account_created',
-        date: new Date().toISOString(),
-        details: 'Account successfully registered.',
-      },
-    ],
-    passwordHash,
-  };
-
-  db.users.push(newPatient);
-  writeDb(db);
-
-  const safeUser = sanitizeUser(newPatient);
+  const safeUser = sanitizeUser(createdPatient);
   const token = signToken({ id: safeUser.id, email: safeUser.email, role: safeUser.role });
 
   res.status(201).json({ token, user: safeUser });
 });
 
 // --- Auth: Register Hospital ---
-app.post('/api/auth/register/hospital', (req, res) => {
-  const data = (req.body ?? {}) as Partial<Hospital> & { password?: unknown };
+app.post('/api/auth/register/hospital', registerRateLimiter, validateBody(registerHospitalBodySchema), (req, res) => {
+  const data = req.body as Omit<Partial<Hospital>, 'id' | 'role'> & { password: string; name: string; email: string };
+  const passwordHash = bcrypt.hashSync(data.password, 10);
 
-  if (
-    typeof data.email !== 'string' ||
-    !data.email.trim() ||
-    typeof data.name !== 'string' ||
-    !data.name.trim() ||
-    typeof data.password !== 'string' ||
-    !data.password.trim()
-  ) {
-    res.status(400).json({ error: 'Hospital name, email, and password are required.' });
-    return;
-  }
+  const createdHospital = runInTransaction(() => {
+    if (userEmailExists(data.email)) {
+      return null;
+    }
+    const newId = generateUniqueUserId('HOSP', 4);
+    const newHospital: StoredUser = {
+      id: newId,
+      role: 'Hospital',
+      name: data.name.trim(),
+      email: data.email.trim(),
+      phone: data.phone || '',
+      licenseNumber: data.licenseNumber || '',
+      address: data.address || '',
+      contactPerson: data.contactPerson || '',
+      department: data.department || 'General',
+      verified: false,
+      status: 'pending',
+      patientsAccessed: [],
+      scanLogs: [],
+      passwordHash,
+    };
+    insertUser(newHospital);
+    return newHospital;
+  });
 
-  if (data.password.length < 8 || data.password.toLowerCase() === 'password123') {
-    res.status(400).json({ error: 'Password must be at least 8 characters and not a common default.' });
-    return;
-  }
-
-  const db = readDb();
-  const exists = db.users.some((u) => u.email.toLowerCase() === data.email!.trim().toLowerCase());
-  if (exists) {
+  if (!createdHospital) {
     res.status(409).json({ error: 'An account with this email already exists.' });
     return;
   }
 
-  const newId = `HOSP-${Math.floor(1000 + Math.random() * 9000)}`;
-  const passwordHash = bcrypt.hashSync(data.password, 10);
-
-  const newHospital: StoredUser = {
-    id: newId,
-    role: 'Hospital',
-    name: data.name.trim(),
-    email: data.email.trim(),
-    phone: data.phone || '',
-    licenseNumber: data.licenseNumber || '',
-    address: data.address || '',
-    contactPerson: data.contactPerson || '',
-    department: data.department || 'General',
-    verified: false,
-    status: 'pending',
-    patientsAccessed: [],
-    scanLogs: [],
-    passwordHash,
-  };
-
-  db.users.push(newHospital);
-  writeDb(db);
-
-  const safeUser = sanitizeUser(newHospital);
+  const safeUser = sanitizeUser(createdHospital);
   const token = signToken({ id: safeUser.id, email: safeUser.email, role: safeUser.role });
 
   res.status(201).json({ token, user: safeUser });
@@ -324,8 +328,7 @@ app.post('/api/auth/register/hospital', (req, res) => {
 
 // --- Auth: Current User ---
 app.get('/api/auth/me', authenticateToken, (req: AuthenticatedRequest, res) => {
-  const db = readDb();
-  const found = db.users.find((u) => u.id === req.user?.id);
+  const found = req.user?.id ? getUserById(req.user.id) : undefined;
   if (!found) {
     res.status(404).json({ error: 'User not found' });
     return;
@@ -340,8 +343,7 @@ app.get('/api/users', authenticateToken, (req: AuthenticatedRequest, res) => {
     return;
   }
 
-  const db = readDb();
-  const directoryUsers = db.users.map((u) => {
+  const directoryUsers = getAllUsers().map((u) => {
     const safe = sanitizeUser(u);
     if (safe.role === 'Patient') {
       // Redact confidential patient medical data from bulk directory listings
@@ -376,259 +378,301 @@ const toTier3PatientSummary = (patient: Patient): Partial<Patient> => ({
 });
 
 // --- Users: Get User by ID (Authenticated & Server-Enforced Tier Locking) ---
-app.get('/api/users/:id', authenticateToken, (req: AuthenticatedRequest, res) => {
-  const db = readDb();
-  const found = db.users.find((u) => u.id.toLowerCase() === req.params.id.toLowerCase());
-  if (!found) {
-    res.status(404).json({ error: 'User not found' });
-    return;
-  }
-
-  const requester = req.user!;
-  const isSelf = requester.id.toLowerCase() === found.id.toLowerCase();
-
-  if (requester.role === 'Patient' && !isSelf) {
-    res.status(403).json({ error: 'Access denied. Patients can only view their own profile.' });
-    return;
-  }
-
-  if (requester.role === 'Hospital' && !isSelf) {
-    const callerHospital = db.users.find(
-      (u) => u.id.toLowerCase() === requester.id.toLowerCase() && u.role === 'Hospital'
-    ) as Hospital | undefined;
-
-    if (!callerHospital?.verified) {
-      res.status(403).json({ error: 'Access denied. Hospital account must be verified by an Admin.' });
+app.get(
+  '/api/users/:id',
+  authenticateToken,
+  validateParams(userIdParamSchema),
+  (req: AuthenticatedRequest, res) => {
+    const found = getUserById(req.params.id);
+    if (!found) {
+      res.status(404).json({ error: 'User not found' });
       return;
     }
 
-    if (found.role !== 'Patient') {
-      res.status(403).json({ error: 'Access denied.' });
+    const requester = req.user!;
+    const isSelf = requester.id.toLowerCase() === found.id.toLowerCase();
+
+    if (requester.role === 'Patient' && !isSelf) {
+      res.status(403).json({ error: 'Access denied. Patients can only view their own profile.' });
       return;
     }
-  }
 
-  if (found.role === 'Patient' && !isSelf) {
-    const headerVaultToken =
-      typeof req.headers['x-vault-token'] === 'string' ? req.headers['x-vault-token'] : undefined;
-    const queryVaultToken =
-      typeof req.query.vaultToken === 'string' ? req.query.vaultToken : undefined;
-    const isVaultUnlocked = verifyVaultToken(headerVaultToken || queryVaultToken, found.id);
+    if (requester.role === 'Hospital' && !isSelf) {
+      const callerUser = getUserById(requester.id);
+      const callerHospital = callerUser?.role === 'Hospital' ? (callerUser as Hospital) : undefined;
 
-    if (!isVaultUnlocked) {
-      res.json({
-        user: toTier3PatientSummary(found as Patient),
-        accessTier: '3',
-        tierLocked: true,
-      });
-      return;
-    }
-  }
+      if (!callerHospital?.verified) {
+        res.status(403).json({ error: 'Access denied. Hospital account must be verified by an Admin.' });
+        return;
+      }
 
-  res.json({
-    user: sanitizeUser(found),
-    accessTier: '2',
-    tierLocked: false,
-  });
-});
-
-// --- Users: Update User (Authenticated Owner or Admin Only) ---
-app.put('/api/users/:id', authenticateToken, (req: AuthenticatedRequest, res) => {
-  const db = readDb();
-  const index = db.users.findIndex((u) => u.id.toLowerCase() === req.params.id.toLowerCase());
-  const incoming = req.body as Partial<StoredUser>;
-
-  if (index === -1) {
-    res.status(404).json({ error: 'User not found' });
-    return;
-  }
-
-  const existing = db.users[index];
-  const requester = req.user!;
-  const isSelf = requester.id.toLowerCase() === existing.id.toLowerCase();
-  const isAdmin = requester.role === 'Admin';
-
-  if (!isSelf && !isAdmin) {
-    res.status(403).json({ error: 'Access denied. You can only update your own profile.' });
-    return;
-  }
-
-  // Preserve immutable fields (id, role, passwordHash) and server-managed collections
-  const updated: StoredUser = {
-    ...existing,
-    ...incoming,
-    id: existing.id,
-    role: existing.role,
-    passwordHash: existing.passwordHash,
-  } as StoredUser;
-
-  if (existing.role === 'Patient') {
-    (updated as Patient).medicalRecords = existing.medicalRecords || [];
-    (updated as Patient).activityLog = existing.activityLog || [];
-  } else if (existing.role === 'Hospital') {
-    (updated as Hospital).patientsAccessed = existing.patientsAccessed || [];
-    (updated as Hospital).scanLogs = existing.scanLogs || [];
-    // Prevent non-Admins from self-verifying a Hospital account
-    if (!isAdmin) {
-      (updated as Hospital).verified = existing.verified;
-      (updated as Hospital).status = existing.status;
-    }
-  }
-
-  db.users[index] = updated;
-  writeDb(db);
-
-  res.json({ user: sanitizeUser(updated) });
-});
-
-// --- Medical Records: Add Record (Authenticated Patient Owner Only) ---
-app.post('/api/users/:id/records', authenticateToken, (req: AuthenticatedRequest, res) => {
-  const db = readDb();
-  const index = db.users.findIndex(
-    (u) => u.id.toLowerCase() === req.params.id.toLowerCase() && u.role === 'Patient'
-  );
-  if (index === -1) {
-    res.status(404).json({ error: 'Patient not found' });
-    return;
-  }
-
-  const patient = db.users[index] as Patient & { passwordHash?: string };
-  if (req.user?.id.toLowerCase() !== patient.id.toLowerCase()) {
-    res.status(403).json({ error: 'Access denied. You can only add records to your own medical vault.' });
-    return;
-  }
-
-  const recordInput = req.body as Omit<MedicalRecord, 'id'> & { id?: string };
-
-  const newRecord: MedicalRecord = {
-    id: recordInput.id || crypto.randomUUID(),
-    type: recordInput.type || 'consultation',
-    title: recordInput.title || 'Untitled Record',
-    doctor: recordInput.doctor || 'Attending Physician',
-    hospital: recordInput.hospital || 'General Clinic',
-    date: recordInput.date || new Date().toISOString().split('T')[0],
-    summary: recordInput.summary || '',
-    details: recordInput.details || '',
-    tags: Array.isArray(recordInput.tags) ? recordInput.tags : [],
-    fileName: recordInput.fileName,
-    fileSize: recordInput.fileSize,
-  };
-
-  const newLog: ActivityLog = {
-    id: crypto.randomUUID(),
-    type: 'record_added',
-    date: new Date().toISOString(),
-    details: `Added new ${newRecord.type} record: ${newRecord.title}`,
-  };
-
-  patient.medicalRecords = [newRecord, ...(patient.medicalRecords || [])];
-  patient.activityLog = [newLog, ...(patient.activityLog || [])];
-  db.users[index] = patient;
-  writeDb(db);
-
-  res.status(201).json({ record: newRecord, user: sanitizeUser(patient) });
-});
-
-// --- Medical Records: Delete Record (Authenticated Patient Owner Only) ---
-app.delete('/api/users/:id/records/:recordId', authenticateToken, (req: AuthenticatedRequest, res) => {
-  const db = readDb();
-  const index = db.users.findIndex(
-    (u) => u.id.toLowerCase() === req.params.id.toLowerCase() && u.role === 'Patient'
-  );
-  if (index === -1) {
-    res.status(404).json({ error: 'Patient not found' });
-    return;
-  }
-
-  const patient = db.users[index] as Patient & { passwordHash?: string };
-  if (req.user?.id.toLowerCase() !== patient.id.toLowerCase()) {
-    res.status(403).json({ error: 'Access denied. You can only delete records from your own medical vault.' });
-    return;
-  }
-
-  patient.medicalRecords = (patient.medicalRecords || []).filter((r) => r.id !== req.params.recordId);
-  db.users[index] = patient;
-  writeDb(db);
-
-  res.json({ user: sanitizeUser(patient) });
-});
-
-// --- Activity & Scan Logging (Authenticated Owner Only) ---
-app.post('/api/users/:id/activity', authenticateToken, (req: AuthenticatedRequest, res) => {
-  const db = readDb();
-  const index = db.users.findIndex((u) => u.id.toLowerCase() === req.params.id.toLowerCase());
-  if (index === -1) {
-    res.status(404).json({ error: 'User not found' });
-    return;
-  }
-
-  const targetUser = db.users[index];
-  if (req.user?.id.toLowerCase() !== targetUser.id.toLowerCase()) {
-    res.status(403).json({ error: 'Access denied. You can only log activity for your own account.' });
-    return;
-  }
-
-  const { type, details, extra, scannedPatientId } = req.body as {
-    type: ActivityLog['type'];
-    details: string;
-    extra?: Partial<ActivityLog>;
-    scannedPatientId?: string;
-  };
-
-  const newLog: ActivityLog = {
-    id: crypto.randomUUID(),
-    type,
-    date: new Date().toISOString(),
-    details,
-    ...extra,
-  };
-
-  if (targetUser.role === 'Patient') {
-    targetUser.activityLog = [newLog, ...(targetUser.activityLog || [])];
-  } else if (targetUser.role === 'Hospital') {
-    targetUser.scanLogs = [newLog, ...(targetUser.scanLogs || [])];
-
-    // If a hospital scanned a patient, also record in patientsAccessed and the patient's own activityLog
-    if (scannedPatientId) {
-      const pIdx = db.users.findIndex(
-        (u) => u.id.toLowerCase() === scannedPatientId.toLowerCase() && u.role === 'Patient'
-      );
-      if (pIdx !== -1) {
-        const scannedPatient = db.users[pIdx] as Patient;
-        targetUser.patientsAccessed = [
-          {
-            patientId: scannedPatient.id,
-            patientName: scannedPatient.name,
-            scanDate: newLog.date,
-            accessTier: extra?.accessTier || 'Tier 3',
-            reason: extra?.reason || 'Emergency Admission',
-          },
-          ...(targetUser.patientsAccessed || []),
-        ];
-
-        scannedPatient.activityLog = [
-          {
-            id: crypto.randomUUID(),
-            type: 'tier_scan',
-            date: newLog.date,
-            details: `QR Pass scanned by ${targetUser.name} (${extra?.accessTier || 'Tier 3'})`,
-            hospitalName: targetUser.name,
-            department: targetUser.department,
-            accessTier: extra?.accessTier || 'Tier 3',
-            reason: extra?.reason || 'Emergency Admission',
-          },
-          ...(scannedPatient.activityLog || []),
-        ];
-        db.users[pIdx] = scannedPatient;
+      if (found.role !== 'Patient') {
+        res.status(403).json({ error: 'Access denied.' });
+        return;
       }
     }
+
+    if (found.role === 'Patient' && !isSelf) {
+      const headerVaultToken =
+        typeof req.headers['x-vault-token'] === 'string' ? req.headers['x-vault-token'] : undefined;
+      const queryVaultToken =
+        typeof req.query.vaultToken === 'string' ? req.query.vaultToken : undefined;
+      const isVaultUnlocked = verifyVaultToken(headerVaultToken || queryVaultToken, found.id);
+
+      if (!isVaultUnlocked) {
+        res.json({
+          user: toTier3PatientSummary(found as Patient),
+          accessTier: '3',
+          tierLocked: true,
+        });
+        return;
+      }
+    }
+
+    res.json({
+      user: sanitizeUser(found),
+      accessTier: '2',
+      tierLocked: false,
+    });
   }
+);
 
-  db.users[index] = targetUser;
-  writeDb(db);
+// --- Users: Update User (Authenticated Owner or Admin Only) ---
+app.put(
+  '/api/users/:id',
+  authenticateToken,
+  validateParams(userIdParamSchema),
+  validateBody(updateUserBodySchema),
+  (req: AuthenticatedRequest, res) => {
+    const incoming = req.body as Partial<StoredUser>;
+    const requester = req.user!;
+    const isAdmin = requester.role === 'Admin';
 
-  res.status(201).json({ log: newLog, user: sanitizeUser(targetUser) });
-});
+    const outcome = runInTransaction(() => {
+      const existing = getUserById(req.params.id);
+      if (!existing) {
+        return { status: 404 as const, error: 'User not found' };
+      }
+
+      const isSelf = requester.id.toLowerCase() === existing.id.toLowerCase();
+      if (!isSelf && !isAdmin) {
+        return { status: 403 as const, error: 'Access denied. You can only update your own profile.' };
+      }
+
+      const updated: StoredUser = {
+        ...existing,
+        ...incoming,
+        id: existing.id,
+        role: existing.role,
+        passwordHash: existing.passwordHash,
+      } as StoredUser;
+
+      if (existing.role === 'Patient') {
+        (updated as Patient).medicalRecords = existing.medicalRecords || [];
+        (updated as Patient).activityLog = existing.activityLog || [];
+      } else if (existing.role === 'Hospital') {
+        (updated as Hospital).patientsAccessed = existing.patientsAccessed || [];
+        (updated as Hospital).scanLogs = existing.scanLogs || [];
+        if (!isAdmin) {
+          (updated as Hospital).verified = existing.verified;
+          (updated as Hospital).status = existing.status;
+        }
+      }
+
+      saveUser(updated);
+      return { status: 200 as const, user: updated };
+    });
+
+    if (outcome.status !== 200) {
+      res.status(outcome.status).json({ error: outcome.error });
+      return;
+    }
+
+    res.json({ user: sanitizeUser(outcome.user) });
+  }
+);
+
+// --- Medical Records: Add Record (Authenticated Patient Owner Only) ---
+app.post(
+  '/api/users/:id/records',
+  authenticateToken,
+  validateParams(userIdParamSchema),
+  validateBody(addMedicalRecordBodySchema),
+  (req: AuthenticatedRequest, res) => {
+    const recordInput = req.body as Omit<MedicalRecord, 'id'>;
+
+    const outcome = runInTransaction(() => {
+      const found = getUserById(req.params.id);
+      if (!found || found.role !== 'Patient') {
+        return { status: 404 as const, error: 'Patient not found' };
+      }
+
+      const patient = found as Patient & { passwordHash?: string };
+      if (req.user?.id.toLowerCase() !== patient.id.toLowerCase()) {
+        return {
+          status: 403 as const,
+          error: 'Access denied. You can only add records to your own medical vault.',
+        };
+      }
+
+      const newRecord: MedicalRecord = {
+        id: crypto.randomUUID(),
+        type: recordInput.type,
+        title: recordInput.title,
+        doctor: recordInput.doctor,
+        hospital: recordInput.hospital,
+        date: recordInput.date,
+        summary: recordInput.summary,
+        details: recordInput.details || '',
+        tags: Array.isArray(recordInput.tags) ? recordInput.tags : [],
+        fileName: recordInput.fileName,
+        fileSize: recordInput.fileSize,
+      };
+
+      const newLog: ActivityLog = {
+        id: crypto.randomUUID(),
+        type: 'record_added',
+        date: new Date().toISOString(),
+        details: `Added new ${newRecord.type} record: ${newRecord.title}`,
+      };
+
+      patient.medicalRecords = [newRecord, ...(patient.medicalRecords || [])];
+      patient.activityLog = [newLog, ...(patient.activityLog || [])];
+      saveUser(patient);
+
+      return { status: 201 as const, record: newRecord, user: patient };
+    });
+
+    if (outcome.status !== 201) {
+      res.status(outcome.status).json({ error: outcome.error });
+      return;
+    }
+
+    res.status(201).json({ record: outcome.record, user: sanitizeUser(outcome.user) });
+  }
+);
+
+// --- Medical Records: Delete Record (Authenticated Patient Owner Only) ---
+app.delete(
+  '/api/users/:id/records/:recordId',
+  authenticateToken,
+  validateParams(deleteRecordParamSchema),
+  (req: AuthenticatedRequest, res) => {
+    const outcome = runInTransaction(() => {
+      const found = getUserById(req.params.id);
+      if (!found || found.role !== 'Patient') {
+        return { status: 404 as const, error: 'Patient not found' };
+      }
+
+      const patient = found as Patient & { passwordHash?: string };
+      if (req.user?.id.toLowerCase() !== patient.id.toLowerCase()) {
+        return {
+          status: 403 as const,
+          error: 'Access denied. You can only delete records from your own medical vault.',
+        };
+      }
+
+      patient.medicalRecords = (patient.medicalRecords || []).filter(
+        (r) => r.id !== req.params.recordId
+      );
+      saveUser(patient);
+      return { status: 200 as const, user: patient };
+    });
+
+    if (outcome.status !== 200) {
+      res.status(outcome.status).json({ error: outcome.error });
+      return;
+    }
+
+    res.json({ user: sanitizeUser(outcome.user) });
+  }
+);
+
+// --- Activity & Scan Logging (Authenticated Owner Only) ---
+app.post(
+  '/api/users/:id/activity',
+  authenticateToken,
+  validateParams(userIdParamSchema),
+  validateBody(logActivityBodySchema),
+  (req: AuthenticatedRequest, res) => {
+    const { type, details, extra, scannedPatientId } = req.body as {
+      type: ActivityLog['type'];
+      details: string;
+      extra?: Partial<ActivityLog>;
+      scannedPatientId?: string;
+    };
+
+    const outcome = runInTransaction(() => {
+      const targetUser = getUserById(req.params.id);
+      if (!targetUser) {
+        return { status: 404 as const, error: 'User not found' };
+      }
+
+      if (req.user?.id.toLowerCase() !== targetUser.id.toLowerCase()) {
+        return {
+          status: 403 as const,
+          error: 'Access denied. You can only log activity for your own account.',
+        };
+      }
+
+      const newLog: ActivityLog = {
+        id: crypto.randomUUID(),
+        type,
+        date: new Date().toISOString(),
+        details,
+        ...extra,
+      };
+
+      if (targetUser.role === 'Patient') {
+        targetUser.activityLog = [newLog, ...(targetUser.activityLog || [])];
+      } else if (targetUser.role === 'Hospital') {
+        targetUser.scanLogs = [newLog, ...(targetUser.scanLogs || [])];
+
+        if (scannedPatientId) {
+          const foundPatient = getUserById(scannedPatientId);
+          if (foundPatient && foundPatient.role === 'Patient') {
+            const scannedPatient = foundPatient as Patient & { passwordHash?: string };
+            targetUser.patientsAccessed = [
+              {
+                patientId: scannedPatient.id,
+                patientName: scannedPatient.name,
+                scanDate: newLog.date,
+                accessTier: extra?.accessTier || 'Tier 3',
+                reason: extra?.reason || 'Emergency Admission',
+              },
+              ...(targetUser.patientsAccessed || []),
+            ];
+
+            scannedPatient.activityLog = [
+              {
+                id: crypto.randomUUID(),
+                type: 'tier_scan',
+                date: newLog.date,
+                details: `QR Pass scanned by ${targetUser.name} (${extra?.accessTier || 'Tier 3'})`,
+                hospitalName: targetUser.name,
+                department: targetUser.department,
+                accessTier: extra?.accessTier || 'Tier 3',
+                reason: extra?.reason || 'Emergency Admission',
+              },
+              ...(scannedPatient.activityLog || []),
+            ];
+            saveUser(scannedPatient);
+          }
+        }
+      }
+
+      saveUser(targetUser);
+      return { status: 201 as const, log: newLog, user: targetUser };
+    });
+
+    if (outcome.status !== 201) {
+      res.status(outcome.status).json({ error: outcome.error });
+      return;
+    }
+
+    res.status(201).json({ log: outcome.log, user: sanitizeUser(outcome.user) });
+  }
+);
 
 // --- Scan OTP Generation, Status & Verification (Rate-Limited & Brute-Force Protected) ---
 const OTP_VERIFY_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
@@ -658,238 +702,287 @@ const checkRateLimit = (
   return { allowed: true, retryAfterSec: 0 };
 };
 
-app.post('/api/scan/request-otp', authenticateToken, (req: AuthenticatedRequest, res) => {
-  const { patientId, requestedBy } = req.body as { patientId?: string; requestedBy?: string };
-  if (!patientId || typeof patientId !== 'string') {
-    res.status(400).json({ error: 'patientId is required' });
-    return;
-  }
+app.post(
+  '/api/scan/request-otp',
+  otpRequestRateLimiter,
+  authenticateToken,
+  validateBody(requestOtpBodySchema),
+  (req: AuthenticatedRequest, res) => {
+    const { patientId, requestedBy } = req.body as { patientId: string; requestedBy?: string };
+    const normalizedPatientId = patientId.trim();
+    const requester = req.user!;
+    const isPatientSelf =
+      requester.role === 'Patient' && requester.id.toLowerCase() === normalizedPatientId.toLowerCase();
+    const isHospital = requester.role === 'Hospital';
 
-  const normalizedPatientId = patientId.trim();
-  const requester = req.user!;
-  const isPatientSelf =
-    requester.role === 'Patient' && requester.id.toLowerCase() === normalizedPatientId.toLowerCase();
-  const isHospital = requester.role === 'Hospital';
-
-  if (!isPatientSelf && !isHospital) {
-    res.status(403).json({ error: 'Access denied. Only the patient or an authorized hospital can request an OTP.' });
-    return;
-  }
-
-  const rateKey = `${req.ip || 'unknown'}:${normalizedPatientId.toLowerCase()}`;
-  const rateCheck = checkRateLimit(otpRequestRateMap, rateKey, MAX_OTP_REQUESTS, OTP_REQUEST_WINDOW_MS);
-  if (!rateCheck.allowed) {
-    res.setHeader('Retry-After', String(rateCheck.retryAfterSec));
-    res.status(429).json({
-      error: `Too many OTP requests. Please wait ${rateCheck.retryAfterSec} seconds before requesting another code.`,
-    });
-    return;
-  }
-
-  const db = readDb();
-  const pIdx = db.users.findIndex(
-    (u) => u.id.toLowerCase() === normalizedPatientId.toLowerCase() && u.role === 'Patient'
-  );
-  if (pIdx === -1) {
-    res.status(404).json({ error: 'Patient not found' });
-    return;
-  }
-
-  const patient = db.users[pIdx] as Patient;
-  const code = String(crypto.randomInt(100000, 1000000));
-  const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes validity
-
-  db.otpCodes[patient.id] = {
-    code,
-    expiresAt,
-    attempts: 0,
-  };
-
-  // Reset verification lockout for this patient when a fresh OTP is legitimately generated by the patient
-  if (isPatientSelf) {
-    otpVerifyRateMap.delete(rateKey);
-  }
-
-  // Log OTP generation in patient's activity log
-  patient.activityLog = [
-    {
-      id: crypto.randomUUID(),
-      type: 'tier_scan',
-      date: new Date().toISOString(),
-      details: `6-digit OTP generated for Tier 2 access${requestedBy ? ` (Requested by ${requestedBy})` : ''}`,
-      accessTier: 'Tier 2',
-    },
-    ...(patient.activityLog || []),
-  ];
-  db.users[pIdx] = patient;
-
-  writeDb(db);
-
-  // Never expose otp or demoOtp in POST /api/scan/request-otp response
-  res.json({
-    message: '6-digit OTP generated. The patient can view the active code on their authenticated QR Pass.',
-    expiresAt,
-  });
-});
-
-app.get('/api/scan/otp/:patientId', authenticateToken, (req: AuthenticatedRequest, res) => {
-  if (
-    req.user?.role !== 'Patient' ||
-    req.user.id.toLowerCase() !== req.params.patientId.toLowerCase()
-  ) {
-    res.status(403).json({ error: 'Access denied. Only the authenticated patient can view their active OTP.' });
-    return;
-  }
-
-  const db = readDb();
-  const patient = db.users.find(
-    (u) => u.id.toLowerCase() === req.params.patientId.toLowerCase() && u.role === 'Patient'
-  );
-  const key = patient ? patient.id : req.params.patientId;
-  const stored = db.otpCodes[key];
-
-  if (!stored || stored.expiresAt <= Date.now()) {
-    res.json({ active: false });
-    return;
-  }
-  res.json({
-    active: true,
-    otp: stored.code,
-    expiresAt: stored.expiresAt,
-  });
-});
-
-app.post('/api/scan/verify-otp', authenticateToken, (req: AuthenticatedRequest, res) => {
-  const { patientId, otp } = req.body as { patientId?: string; otp?: string };
-  if (!patientId || !otp || typeof patientId !== 'string' || typeof otp !== 'string') {
-    res.status(400).json({ error: 'patientId and otp are required' });
-    return;
-  }
-
-  const normalizedPatientId = patientId.trim();
-  const rateKey = `${req.ip || 'unknown'}:${normalizedPatientId.toLowerCase()}`;
-  const rateCheck = checkRateLimit(otpVerifyRateMap, rateKey, MAX_OTP_ATTEMPTS, OTP_VERIFY_WINDOW_MS);
-  if (!rateCheck.allowed) {
-    res.setHeader('Retry-After', String(rateCheck.retryAfterSec));
-    res.status(429).json({
-      error: `Too many OTP verification attempts. Locked for ${rateCheck.retryAfterSec} seconds.`,
-    });
-    return;
-  }
-
-  const db = readDb();
-  const pIdx = db.users.findIndex(
-    (u) => u.id.toLowerCase() === normalizedPatientId.toLowerCase() && u.role === 'Patient'
-  );
-  const canonicalId = pIdx !== -1 ? db.users[pIdx].id : normalizedPatientId;
-  const stored = db.otpCodes[canonicalId];
-  const cleanOtp = otp.trim();
-
-  if (!stored || stored.expiresAt <= Date.now()) {
-    if (stored) {
-      delete db.otpCodes[canonicalId];
-      writeDb(db);
+    if (!isPatientSelf && !isHospital) {
+      res.status(403).json({ error: 'Access denied. Only the patient or an authorized hospital can request an OTP.' });
+      return;
     }
-    res.status(400).json({ error: 'OTP has expired or was not requested. Please generate a new OTP.' });
-    return;
-  }
 
-  const currentAttempts = (stored.attempts || 0) + 1;
-  const storedBuf = Buffer.from(stored.code, 'utf-8');
-  const inputBuf = Buffer.from(cleanOtp, 'utf-8');
-  const isValidOtp =
-    storedBuf.length === inputBuf.length && crypto.timingSafeEqual(storedBuf, inputBuf);
-
-  if (!isValidOtp) {
-    if (currentAttempts >= MAX_OTP_ATTEMPTS) {
-      delete db.otpCodes[canonicalId];
-      writeDb(db);
+    const rateKey = `${req.ip || 'unknown'}:${normalizedPatientId.toLowerCase()}`;
+    const rateCheck = checkRateLimit(otpRequestRateMap, rateKey, MAX_OTP_REQUESTS, OTP_REQUEST_WINDOW_MS);
+    if (!rateCheck.allowed) {
+      res.setHeader('Retry-After', String(rateCheck.retryAfterSec));
       res.status(429).json({
-        error: 'Maximum failed OTP attempts exceeded. This OTP has been invalidated; please generate a new code.',
+        error: `Too many OTP requests. Please wait ${rateCheck.retryAfterSec} seconds before requesting another code.`,
       });
       return;
     }
 
-    stored.attempts = currentAttempts;
-    db.otpCodes[canonicalId] = stored;
-    writeDb(db);
-    res.status(400).json({
-      error: `Invalid 6-digit OTP code (${MAX_OTP_ATTEMPTS - currentAttempts} attempt(s) remaining).`,
+    const code = String(crypto.randomInt(100000, 1000000));
+    const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes validity
+
+    const created = runInTransaction(() => {
+      const found = getUserById(normalizedPatientId);
+      if (!found || found.role !== 'Patient') {
+        return false;
+      }
+      const patient = found as Patient & { passwordHash?: string };
+      upsertOtpCode(patient.id, {
+        code,
+        expiresAt,
+        attempts: 0,
+      });
+
+      patient.activityLog = [
+        {
+          id: crypto.randomUUID(),
+          type: 'tier_scan',
+          date: new Date().toISOString(),
+          details: `6-digit OTP generated for Tier 2 access${requestedBy ? ` (Requested by ${requestedBy})` : ''}`,
+          accessTier: 'Tier 2',
+        },
+        ...(patient.activityLog || []),
+      ];
+      saveUser(patient);
+      return true;
     });
-    return;
+
+    if (!created) {
+      res.status(404).json({ error: 'Patient not found' });
+      return;
+    }
+
+    // Reset verification lockout for this patient when a fresh OTP is legitimately generated by the patient
+    if (isPatientSelf) {
+      otpVerifyRateMap.delete(rateKey);
+    }
+
+    // Never expose otp or demoOtp in POST /api/scan/request-otp response
+    res.json({
+      message: '6-digit OTP generated. The patient can view the active code on their authenticated QR Pass.',
+      expiresAt,
+    });
   }
+);
 
-  // Consume one-time code, clear rate limiter for this key, and log successful Tier 2 unlock
-  delete db.otpCodes[canonicalId];
-  otpVerifyRateMap.delete(rateKey);
+app.get(
+  '/api/scan/otp/:patientId',
+  otpStatusRateLimiter,
+  authenticateToken,
+  validateParams(patientIdParamSchema),
+  (req: AuthenticatedRequest, res) => {
+    if (
+      req.user?.role !== 'Patient' ||
+      req.user.id.toLowerCase() !== req.params.patientId.toLowerCase()
+    ) {
+      res.status(403).json({ error: 'Access denied. Only the authenticated patient can view their active OTP.' });
+      return;
+    }
 
-  if (pIdx !== -1) {
-    const patient = db.users[pIdx] as Patient;
-    patient.activityLog = [
-      {
-        id: crypto.randomUUID(),
-        type: 'tier_scan',
-        date: new Date().toISOString(),
-        details: 'Tier 2 Full Medical Vault unlocked via 6-digit OTP verification',
-        accessTier: 'Tier 2',
-      },
-      ...(patient.activityLog || []),
-    ];
-    db.users[pIdx] = patient;
+    const stored = getOtpCode(req.params.patientId);
+
+    if (!stored || stored.expiresAt <= Date.now()) {
+      res.json({ active: false });
+      return;
+    }
+    res.json({
+      active: true,
+      otp: stored.code,
+      expiresAt: stored.expiresAt,
+    });
   }
-  writeDb(db);
+);
 
-  const vaultToken = signVaultToken(canonicalId);
-  res.json({ verified: true, accessTier: '2', vaultToken });
-});
+app.post(
+  '/api/scan/verify-otp',
+  otpVerifyRateLimiter,
+  authenticateToken,
+  validateBody(verifyOtpBodySchema),
+  (req: AuthenticatedRequest, res) => {
+    const { patientId, otp } = req.body as { patientId: string; otp: string };
+
+    const normalizedPatientId = patientId.trim();
+    const rateKey = `${req.ip || 'unknown'}:${normalizedPatientId.toLowerCase()}`;
+    const rateCheck = checkRateLimit(otpVerifyRateMap, rateKey, MAX_OTP_ATTEMPTS, OTP_VERIFY_WINDOW_MS);
+    if (!rateCheck.allowed) {
+      res.setHeader('Retry-After', String(rateCheck.retryAfterSec));
+      res.status(429).json({
+        error: `Too many OTP verification attempts. Locked for ${rateCheck.retryAfterSec} seconds.`,
+      });
+      return;
+    }
+
+    const cleanOtp = otp.trim();
+
+    const outcome = runInTransaction(() => {
+      const foundPatient = getUserById(normalizedPatientId);
+      const canonicalId =
+        foundPatient && foundPatient.role === 'Patient' ? foundPatient.id : normalizedPatientId;
+      const stored = getOtpCode(canonicalId);
+
+      if (!stored || stored.expiresAt <= Date.now()) {
+        if (stored) {
+          deleteOtpCode(canonicalId);
+        }
+        return {
+          status: 400 as const,
+          error: 'OTP has expired or was not requested. Please generate a new OTP.',
+        };
+      }
+
+      const currentAttempts = (stored.attempts || 0) + 1;
+      const storedBuf = Buffer.from(stored.code, 'utf-8');
+      const inputBuf = Buffer.from(cleanOtp, 'utf-8');
+      const isValidOtp =
+        storedBuf.length === inputBuf.length && crypto.timingSafeEqual(storedBuf, inputBuf);
+
+      if (!isValidOtp) {
+        if (currentAttempts >= MAX_OTP_ATTEMPTS) {
+          deleteOtpCode(canonicalId);
+          return {
+            status: 429 as const,
+            error:
+              'Maximum failed OTP attempts exceeded. This OTP has been invalidated; please generate a new code.',
+          };
+        }
+
+        incrementOtpAttempts(canonicalId, currentAttempts);
+        return {
+          status: 400 as const,
+          error: `Invalid 6-digit OTP code (${MAX_OTP_ATTEMPTS - currentAttempts} attempt(s) remaining).`,
+        };
+      }
+
+      // Consume one-time code and log successful Tier 2 unlock for both patient and hospital audit log
+      deleteOtpCode(canonicalId);
+
+      const nowIso = new Date().toISOString();
+      let auditLogged = false;
+      const callerUser = req.user?.id ? getUserById(req.user.id) : undefined;
+      const callerHospital =
+        callerUser && callerUser.role === 'Hospital'
+          ? (callerUser as Hospital & { passwordHash?: string })
+          : undefined;
+
+      if (foundPatient && foundPatient.role === 'Patient') {
+        const patient = foundPatient as Patient & { passwordHash?: string };
+        patient.activityLog = [
+          {
+            id: crypto.randomUUID(),
+            type: 'tier_scan',
+            date: nowIso,
+            details: callerHospital
+              ? `Tier 2 Full Medical Vault unlocked by ${callerHospital.name} via 6-digit OTP verification`
+              : 'Tier 2 Full Medical Vault unlocked via 6-digit OTP verification',
+            hospitalName: callerHospital?.name,
+            department: callerHospital?.department,
+            accessTier: 'Tier 2',
+            reason: 'OTP Verified Clinical Access',
+          },
+          ...(patient.activityLog || []),
+        ];
+        saveUser(patient);
+
+        if (callerHospital) {
+          const hospitalLog: ActivityLog = {
+            id: crypto.randomUUID(),
+            type: 'tier_scan',
+            date: nowIso,
+            details: `Unlocked Tier 2 full records for ${patient.name} (${patient.id}) via OTP`,
+            hospitalName: callerHospital.name,
+            department: callerHospital.department,
+            accessTier: 'Tier 2',
+            reason: 'OTP Verified Clinical Access',
+          };
+          callerHospital.scanLogs = [hospitalLog, ...(callerHospital.scanLogs || [])];
+          callerHospital.patientsAccessed = [
+            {
+              patientId: patient.id,
+              patientName: patient.name,
+              scanDate: nowIso,
+              accessTier: 'Tier 2',
+              reason: 'OTP Verified Clinical Access',
+            },
+            ...(callerHospital.patientsAccessed || []),
+          ];
+          saveUser(callerHospital);
+          auditLogged = true;
+        }
+      }
+
+      return { status: 200 as const, canonicalId, auditLogged };
+    });
+
+    if (outcome.status !== 200) {
+      res.status(outcome.status).json({ error: outcome.error });
+      return;
+    }
+
+    otpVerifyRateMap.delete(rateKey);
+    const vaultToken = signVaultToken(outcome.canonicalId);
+    res.json({ verified: true, accessTier: '2', vaultToken, auditLogged: outcome.auditLogged });
+  }
+);
 
 // --- AI Health Coach & Clinical Assistant Endpoint ---
-app.post('/api/ai/chat', authenticateToken, (req: AuthenticatedRequest, res) => {
-  const { message } = req.body as { message?: string };
-  if (!message) {
-    res.status(400).json({ error: 'Message is required' });
-    return;
-  }
+app.post(
+  '/api/ai/chat',
+  authenticateToken,
+  validateBody(aiChatBodySchema),
+  (req: AuthenticatedRequest, res) => {
+    const { message } = req.body as { message: string };
 
-  const db = readDb();
-  const currentUser = db.users.find((u) => u.id === req.user?.id);
-  const lower = message.toLowerCase();
+    const currentUser = req.user?.id ? getUserById(req.user.id) : undefined;
+    const lower = message.toLowerCase();
 
-  let reply =
-    'Based on your MedQR+ profile, your vital indicators are stable. Always consult your attending physician before adjusting any treatment plan.';
+    let reply =
+      'Based on your MedQR+ profile, your vital indicators are stable. Always consult your attending physician before adjusting any treatment plan.';
 
-  if (currentUser?.role === 'Patient') {
-    const patient = currentUser as Patient;
-    if (lower.includes('allerg')) {
-      reply =
-        patient.allergies?.length > 0
-          ? `You have ${patient.allergies.length} flagged allergy alert(s): ${patient.allergies.join(', ')}. These are automatically visible in Tier 1 & Tier 3 emergency scans.`
-          : 'You currently have no known allergies recorded in your profile. You can add any in the My Profile tab.';
-    } else if (lower.includes('med') || lower.includes('prescription') || lower.includes('rx') || lower.includes('drug')) {
-      reply =
-        patient.currentMedications?.length > 0
-          ? `Your active medications list includes: ${patient.currentMedications.join(', ')}. Make sure to take them as prescribed.`
-          : 'You have no active medications listed in your profile right now.';
-    } else if (lower.includes('blood')) {
-      reply = `Your recorded blood group is ${patient.bloodGroup || 'not yet set'}.`;
-    } else if (lower.includes('record') || lower.includes('lab') || lower.includes('vault')) {
-      reply =
-        patient.medicalRecords?.length > 0
-          ? `Your vault contains ${patient.medicalRecords.length} medical record(s). The most recent is "${patient.medicalRecords[0].title}" (${patient.medicalRecords[0].date}) — ${patient.medicalRecords[0].summary}`
-          : 'Your Medical Records Vault is currently empty. You can upload prescriptions, lab results, or imaging in the Medical Records section.';
-    } else if (lower.includes('condition') || lower.includes('chronic') || lower.includes('asthma')) {
-      reply =
-        patient.chronicConditions?.length > 0
-          ? `Your profile notes the following chronic condition(s): ${patient.chronicConditions.join(', ')}.`
-          : 'No chronic conditions are currently flagged on your MedQR+ pass.';
+    if (currentUser?.role === 'Patient') {
+      const patient = currentUser as Patient;
+      if (lower.includes('allerg')) {
+        reply =
+          patient.allergies?.length > 0
+            ? `You have ${patient.allergies.length} flagged allergy alert(s): ${patient.allergies.join(', ')}. These are automatically visible in Tier 1 & Tier 3 emergency scans.`
+            : 'You currently have no known allergies recorded in your profile. You can add any in the My Profile tab.';
+      } else if (lower.includes('med') || lower.includes('prescription') || lower.includes('rx') || lower.includes('drug')) {
+        reply =
+          patient.currentMedications?.length > 0
+            ? `Your active medications list includes: ${patient.currentMedications.join(', ')}. Make sure to take them as prescribed.`
+            : 'You have no active medications listed in your profile right now.';
+      } else if (lower.includes('blood')) {
+        reply = `Your recorded blood group is ${patient.bloodGroup || 'not yet set'}.`;
+      } else if (lower.includes('record') || lower.includes('lab') || lower.includes('vault')) {
+        reply =
+          patient.medicalRecords?.length > 0
+            ? `Your vault contains ${patient.medicalRecords.length} medical record(s). The most recent is "${patient.medicalRecords[0].title}" (${patient.medicalRecords[0].date}) — ${patient.medicalRecords[0].summary}`
+            : 'Your Medical Records Vault is currently empty. You can upload prescriptions, lab results, or imaging in the Medical Records section.';
+      } else if (lower.includes('condition') || lower.includes('chronic') || lower.includes('asthma')) {
+        reply =
+          patient.chronicConditions?.length > 0
+            ? `Your profile notes the following chronic condition(s): ${patient.chronicConditions.join(', ')}.`
+            : 'No chronic conditions are currently flagged on your MedQR+ pass.';
+      }
+    } else if (currentUser?.role === 'Hospital') {
+      const hospital = currentUser as Hospital;
+      reply = `Clinical Assistant ready for ${hospital.name} (${hospital.department} Dept). You have accessed ${hospital.patientsAccessed?.length || 0} patient record(s) recently. Ask me about drug interactions, triage protocols, or patient scan summaries.`;
     }
-  } else if (currentUser?.role === 'Hospital') {
-    const hospital = currentUser as Hospital;
-    reply = `Clinical Assistant ready for ${hospital.name} (${hospital.department} Dept). You have accessed ${hospital.patientsAccessed?.length || 0} patient record(s) recently. Ask me about drug interactions, triage protocols, or patient scan summaries.`;
-  }
 
-  res.json({ reply, timestamp: new Date().toISOString() });
-});
+    res.json({ reply, timestamp: new Date().toISOString() });
+  }
+);
 
 const escapeHtml = (value: unknown): string => {
   if (value === null || value === undefined) return '';
@@ -902,12 +995,22 @@ const escapeHtml = (value: unknown): string => {
 };
 
 // --- Instant Mobile & Wi-Fi QR Scan Medical Report Page (Server-Enforced Tier Locking & XSS-Safe) ---
-app.get('/scan-result/:tier', (req, res) => {
-  const patientId = String(req.query.id || 'MQR-2026-12345');
-  const db = readDb();
-  const found = db.users.find(
-    (u) => u.id.toLowerCase() === patientId.toLowerCase() && u.role === 'Patient'
-  ) as Patient | undefined;
+app.get('/scan-result', validateQuery(scanResultQuerySchema), (_req, res) => {
+  res.status(400).json({ error: 'Tier parameter (/scan-result/:tier) and patient ID (?id=...) are required.' });
+});
+
+app.get(
+  '/scan-result/:tier',
+  validateParams(scanResultParamSchema),
+  validateQuery(scanResultQuerySchema),
+  (req, res) => {
+    const patientId = typeof req.query.id === 'string' ? req.query.id.trim() : '';
+    if (!patientId) {
+      res.status(400).json({ error: 'Patient ID query parameter (?id=...) is required.' });
+      return;
+    }
+    const foundUser = getUserById(patientId);
+    const found = foundUser?.role === 'Patient' ? (foundUser as Patient) : undefined;
 
   if (!found) {
     res.status(404).send(`<!DOCTYPE html>
@@ -1163,6 +1266,28 @@ app.get('/scan-result/:tier', (req, res) => {
         errEl.style.display = 'block';
         return;
       }
+      if (!data.auditLogged && token) {
+        try {
+          const meRes = await fetch('/api/auth/me', { headers });
+          if (meRes.ok) {
+            const meData = await meRes.json();
+            if (meData.user && meData.user.role === 'Hospital') {
+              await fetch('/api/users/' + encodeURIComponent(meData.user.id) + '/activity', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                  type: 'tier_scan',
+                  details: 'Unlocked Tier 2 full records for ' + patientId + ' via OTP',
+                  extra: { accessTier: 'Tier 2', reason: 'OTP Verified Clinical Access' },
+                  scannedPatientId: patientId
+                })
+              });
+            }
+          }
+        } catch (e) {
+          // Ignore fallback logging error before redirect
+        }
+      }
       window.location.href = '/scan-result/2?id=' + encodeURIComponent(patientId) + '&vaultToken=' + encodeURIComponent(data.vaultToken);
     }
   </script>
@@ -1171,12 +1296,10 @@ app.get('/scan-result/:tier', (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  // Ensure DB is initialized and seeded on startup
-  readDb();
   if (isTunnelOptIn) {
     startPublicTunnel();
   }
-  console.log(`✅ MedQR+ Backend Server running on http://0.0.0.0:${PORT}`);
+  console.log(`✅ MedQR+ Backend Server running on http://0.0.0.0:${PORT} (SQLite: ${getUsersCount()} users)`);
 });
 
 export default app;

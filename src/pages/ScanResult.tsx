@@ -1,14 +1,14 @@
 import React, { useState, useEffect } from 'react';
 import { useLocation, useParams, Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
-import { apiFetch } from '../utils/api';
+import { API_BASE, apiFetch } from '../utils/api';
 import type { Patient } from '../types';
 import { ShieldAlert, ShieldCheck, Lock, AlertTriangle, ArrowLeft, KeyRound, RefreshCw, CheckCircle2, FileText, Activity, Shield } from 'lucide-react';
 
 export const ScanResult = () => {
   const { tier } = useParams<{ tier: string }>();
   const location = useLocation();
-  const { user, logActivity } = useAuth();
+  const { user, refreshUser, logActivity } = useAuth();
   const [patient, setPatient] = useState<Patient | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [notFound, setNotFound] = useState<boolean>(false);
@@ -19,12 +19,21 @@ export const ScanResult = () => {
   const [accessLevel, setAccessLevel] = useState<string>('3');
 
   const queryParams = new URLSearchParams(location.search);
-  const patientId = queryParams.get('id') || 'MQR-2026-12345';
+  const patientId = (queryParams.get('id') || '').trim();
   const queryVaultToken = queryParams.get('vaultToken') || '';
 
   const getVaultTokenKey = (id: string) => `medqr_vault_token_${id.toLowerCase()}`;
+  const getScanMarkerKey = (hospitalId: string, patId: string, tierVal: string) =>
+    `medqr_scan_logged_${hospitalId.toLowerCase()}_${patId.toLowerCase()}_${tierVal}`;
 
   const fetchPatientRecord = (overrideVaultToken?: string) => {
+    if (!patientId) {
+      setPatient(null);
+      setNotFound(true);
+      setLoading(false);
+      return;
+    }
+
     setLoading(true);
     setNotFound(false);
 
@@ -39,19 +48,38 @@ export const ScanResult = () => {
       headers['x-vault-token'] = storedVaultToken;
     }
 
-    apiFetch(`/api/users/${encodeURIComponent(patientId)}`, {
+    apiFetch(`${API_BASE}/users/${encodeURIComponent(patientId)}`, {
       headers,
     })
       .then((res) => (res.ok ? res.json() : Promise.reject()))
       .then((data: { user?: Patient; tierLocked?: boolean; accessTier?: string }) => {
         if (data.user && data.user.role === 'Patient') {
-          setPatient(data.user);
+          const loadedPatient = data.user;
+          setPatient(loadedPatient);
           // Server strictly decides whether Tier 2 is unlocked; never allow URL /scan-result/2 to bypass server lock
-          if (data.tierLocked === false && tier !== '3') {
-            setAccessLevel('2');
-          } else {
-            setAccessLevel('3');
+          const resolvedTier = data.tierLocked === false && tier !== '3' ? '2' : '3';
+          setAccessLevel(resolvedTier);
+
+          // Fallback hospital audit log when /scan-result is opened directly or redirected after OTP verification
+          if (user?.role === 'Hospital') {
+            const markerKey = getScanMarkerKey(user.id, loadedPatient.id, resolvedTier);
+            if (!sessionStorage.getItem(markerKey)) {
+              sessionStorage.setItem(markerKey, '1');
+              logActivity(
+                user.id,
+                'tier_scan',
+                resolvedTier === '2'
+                  ? `Unlocked Tier 2 full records for ${loadedPatient.name} (${loadedPatient.id}) via OTP`
+                  : `Scanned patient ${loadedPatient.name} (${loadedPatient.id}) — Tier 3`,
+                {
+                  accessTier: `Tier ${resolvedTier}` as any,
+                  reason: resolvedTier === '2' ? 'OTP Verified Clinical Access' : 'Emergency Scan',
+                },
+                loadedPatient.id
+              );
+            }
           }
+
           setLoading(false);
         } else {
           setNotFound(true);
@@ -65,6 +93,12 @@ export const ScanResult = () => {
   };
 
   useEffect(() => {
+    if (!patientId) {
+      setPatient(null);
+      setNotFound(true);
+      setLoading(false);
+      return;
+    }
     if (queryVaultToken) {
       sessionStorage.setItem(getVaultTokenKey(patientId), queryVaultToken);
     }
@@ -83,22 +117,31 @@ export const ScanResult = () => {
     );
   }
 
-  if (notFound || !patient) {
+  if (!patientId || notFound || !patient) {
     return (
       <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-6 text-center">
         <div className="bg-white p-8 rounded-[16px] shadow-sm border border-gray-100 max-w-md w-full">
           <div className="w-12 h-12 rounded-xl bg-red-50 text-red-500 flex items-center justify-center mx-auto mb-4">
             <ShieldAlert size={24} />
           </div>
-          <h2 className="text-xl font-bold text-gray-900 mb-2">Patient Record Not Accessible</h2>
+          <h2 className="text-xl font-bold text-gray-900 mb-2">
+            {!patientId ? 'Missing Patient ID' : 'Patient Record Not Accessible'}
+          </h2>
           <p className="text-sm text-gray-500 mb-6">
-            Could not locate or authorize access to MedQR+ ID <span className="font-mono font-bold text-gray-800">{patientId}</span>. Please ensure you are signed in with an authorized account.
+            {!patientId ? (
+              'No patient ID (?id=...) was provided in the scan URL. Please scan a valid MedQR+ pass or enter a Patient ID.'
+            ) : (
+              <>
+                Could not locate or authorize access to MedQR+ ID{' '}
+                <span className="font-mono font-bold text-gray-800">{patientId}</span>. Please ensure you are signed in with an authorized account.
+              </>
+            )}
           </p>
           <Link
-            to="/login"
+            to={user ? '/dashboard' : '/login'}
             className="inline-flex items-center justify-center bg-[#1e293b] text-white px-6 py-2.5 rounded-lg text-sm font-bold"
           >
-            Sign In to MedQR+
+            {user ? 'Return to Dashboard' : 'Sign In to MedQR+'}
           </Link>
         </div>
       </div>
@@ -110,7 +153,7 @@ export const ScanResult = () => {
     setOtpNotice('');
     setIsRequesting(true);
 
-    apiFetch('/api/scan/request-otp', {
+    apiFetch(`${API_BASE}/scan/request-otp`, {
       method: 'POST',
       body: JSON.stringify({
         patientId: patient.id,
@@ -140,7 +183,7 @@ export const ScanResult = () => {
     e.preventDefault();
     setOtpError('');
 
-    apiFetch('/api/scan/verify-otp', {
+    apiFetch(`${API_BASE}/scan/verify-otp`, {
       method: 'POST',
       body: JSON.stringify({ patientId: patient.id, otp }),
     })
@@ -149,21 +192,26 @@ export const ScanResult = () => {
         if (!res.ok || !data.vaultToken) {
           throw new Error(data.error || 'Invalid OTP code');
         }
-        return data as { vaultToken: string };
+        return data as { vaultToken: string; auditLogged?: boolean };
       })
       .then((data) => {
         sessionStorage.setItem(getVaultTokenKey(patient.id), data.vaultToken);
+        if (user?.role === 'Hospital') {
+          sessionStorage.setItem(getScanMarkerKey(user.id, patient.id, '2'), '1');
+          if (data.auditLogged) {
+            refreshUser();
+          } else {
+            logActivity(
+              user.id,
+              'tier_scan',
+              `Unlocked Tier 2 full records for ${patient.name} (${patient.id}) via OTP`,
+              { accessTier: 'Tier 2', reason: 'OTP Verified Clinical Access' },
+              patient.id
+            );
+          }
+        }
         fetchPatientRecord(data.vaultToken);
         setAccessLevel('2');
-        if (user?.role === 'Hospital') {
-          logActivity(
-            user.id,
-            'tier_scan',
-            `Unlocked Tier 2 full records for ${patient.name} (${patient.id}) via OTP`,
-            { accessTier: 'Tier 2', reason: 'OTP Verified Clinical Access' },
-            patient.id
-          );
-        }
       })
       .catch((err: Error) => {
         setOtpError(err.message || 'Invalid 6-digit OTP code. Please try again.');

@@ -1,7 +1,7 @@
 import { useRef, useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
-import { apiFetch } from '../utils/api';
+import { API_BASE, apiFetch } from '../utils/api';
 import { QRCodeSVG } from 'qrcode.react';
 import { ShieldCheck, Download, Share2, QrCode, KeyRound, RefreshCw, Copy, Check, ExternalLink, Globe, Wifi } from 'lucide-react';
 
@@ -24,7 +24,7 @@ export const QRPass = () => {
     if (!user || user.role !== 'Patient') return;
 
     // 1. Fetch active OTP if one exists on the backend
-    apiFetch(`/api/scan/otp/${encodeURIComponent(user.id)}`)
+    apiFetch(`${API_BASE}/scan/otp/${encodeURIComponent(user.id)}`)
       .then((res) => (res.ok ? res.json() : Promise.reject()))
       .then((data: { active: boolean; otp?: string; expiresAt?: number }) => {
         if (data.active && data.otp) {
@@ -37,7 +37,7 @@ export const QRPass = () => {
     // 3. Fetch Public HTTPS URL (for Mobile Data + Wi-Fi) and LAN IP
     const currentPort = window.location.port || '5173';
     const fetchNetworkInfo = () => {
-      apiFetch(`/api/network-info?port=${encodeURIComponent(currentPort)}`)
+      apiFetch(`${API_BASE}/network-info?port=${encodeURIComponent(currentPort)}`)
         .then((res) => (res.ok ? res.json() : Promise.reject()))
         .then((data: { lanIp?: string | null; publicUrl?: string | null }) => {
           if (data.lanIp) setLanIp(data.lanIp);
@@ -71,12 +71,12 @@ export const QRPass = () => {
 
   const generateOtp = () => {
     setGenerating(true);
-    apiFetch('/api/scan/request-otp', {
+    apiFetch(`${API_BASE}/scan/request-otp`, {
       method: 'POST',
       body: JSON.stringify({ patientId: user.id, requestedBy: 'Patient Self-Generation' }),
     })
       .then((res) => (res.ok ? res.json() : Promise.reject()))
-      .then(() => apiFetch(`/api/scan/otp/${encodeURIComponent(user.id)}`))
+      .then(() => apiFetch(`${API_BASE}/scan/otp/${encodeURIComponent(user.id)}`))
       .then((res) => (res.ok ? res.json() : Promise.reject()))
       .then((data: { active: boolean; otp?: string; expiresAt?: number }) => {
         if (data.active && data.otp) {
