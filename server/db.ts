@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -406,9 +407,30 @@ export const sanitizeUser = (user: StoredUser): User => {
   return safeUser as User;
 };
 
+const syncSeedAccountPasswords = (): void => {
+  const seedEnvPairs: Array<{ id: string; envKey: string }> = [
+    { id: 'ADMIN-001', envKey: 'SEED_ADMIN_PASSWORD' },
+    { id: 'HOSP-001', envKey: 'SEED_HOSPITAL_PASSWORD' },
+    { id: 'MQR-2026-12345', envKey: 'SEED_PATIENT_PASSWORD' },
+  ];
+
+  for (const { id, envKey } of seedEnvPairs) {
+    const configuredPassword = process.env[envKey]?.trim();
+    if (!configuredPassword || configuredPassword.length < 8 || configuredPassword === 'password123') {
+      continue;
+    }
+    const existing = getUserById(id);
+    if (existing && (!existing.passwordHash || !bcrypt.compareSync(configuredPassword, existing.passwordHash))) {
+      existing.passwordHash = bcrypt.hashSync(configuredPassword, 10);
+      saveUser(existing);
+    }
+  }
+};
+
 // --- Automatic Migration from Legacy database.json or Initial Seed on Startup ---
 const initializeDatabase = (): void => {
   if (getUsersCount() > 0) {
+    runInTransaction(syncSeedAccountPasswords);
     return;
   }
 
@@ -444,6 +466,7 @@ const initializeDatabase = (): void => {
               });
             }
           }
+          syncSeedAccountPasswords();
           console.log(
             `📦 Migrated ${legacyRecords.length} user(s) from legacy database.json to SQLite (${SQLITE_DB_PATH}).`
           );

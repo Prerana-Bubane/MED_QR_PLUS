@@ -62,17 +62,52 @@ const PORT = Number(process.env.PORT) || 5000;
 
 const ALLOWED_ORIGINS = (process.env.FRONTEND_ORIGIN || 'http://localhost:5173,http://127.0.0.1:5173')
   .split(',')
-  .map((o) => o.trim())
+  .map((o) => o.trim().replace(/\/+$/, ''))
   .filter(Boolean);
+
+const isOriginAllowed = (origin: string): boolean => {
+  const normalized = origin.trim().replace(/\/+$/, '');
+  if (ALLOWED_ORIGINS.includes(normalized)) {
+    return true;
+  }
+  if (process.env.NODE_ENV !== 'production') {
+    try {
+      const parsed = new URL(normalized);
+      const host = parsed.hostname.toLowerCase();
+      if (
+        host === 'localhost' ||
+        host === '127.0.0.1' ||
+        host === '[::1]' ||
+        host.startsWith('10.') ||
+        host.startsWith('192.168.') ||
+        /^172\.(1[6-9]|2\d|3[0-1])\./.test(host) ||
+        host.endsWith('.lhr.life') ||
+        host.endsWith('.vercel.app')
+      ) {
+        return true;
+      }
+    } catch {
+      return false;
+    }
+  }
+  return false;
+};
+
+app.use((req, res, next) => {
+  if (req.headers['access-control-request-private-network'] === 'true') {
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  }
+  next();
+});
 
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow same-origin / non-browser requests (no Origin header) or explicitly whitelisted frontend origins
-      if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+      // Allow same-origin / non-browser requests (no Origin header) or allowed frontend origins
+      if (!origin || isOriginAllowed(origin)) {
         callback(null, true);
       } else {
-        callback(new Error('Not allowed by CORS'));
+        callback(null, false);
       }
     },
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -1295,11 +1330,11 @@ app.get(
 </html>`);
 });
 
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, () => {
   if (isTunnelOptIn) {
     startPublicTunnel();
   }
-  console.log(`✅ MedQR+ Backend Server running on http://0.0.0.0:${PORT} (SQLite: ${getUsersCount()} users)`);
+  console.log(`✅ MedQR+ Backend Server running on http://localhost:${PORT} (SQLite: ${getUsersCount()} users)`);
 });
 
 export default app;

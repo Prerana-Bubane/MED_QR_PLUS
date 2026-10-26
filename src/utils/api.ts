@@ -3,16 +3,6 @@ export const TOKEN_KEY = 'medqr_token';
 const normalizeApiBase = (rawUrl?: string): string => {
   const trimmed = (rawUrl || '').trim().replace(/\/+$/, '');
   if (!trimmed) {
-    if (
-      import.meta.env.PROD &&
-      typeof window !== 'undefined' &&
-      window.location.hostname !== 'localhost' &&
-      window.location.hostname !== '127.0.0.1'
-    ) {
-      console.error(
-        '[MedQR+] VITE_API_URL is not set in production. Set VITE_API_URL to your hosted backend URL (e.g. https://medqr-backend.onrender.com/api).'
-      );
-    }
     return '/api';
   }
   if ((trimmed.startsWith('http://') || trimmed.startsWith('https://')) && !trimmed.endsWith('/api')) {
@@ -70,14 +60,85 @@ export const resolveApiUrl = (pathOrUrl: string): string => {
   return `${API_BASE}${pathOrUrl.startsWith('/') ? pathOrUrl : `/${pathOrUrl}`}`;
 };
 
+const getDirectLocalFallbackUrls = (resolvedPath: string): string[] => {
+  if (!resolvedPath.startsWith('/api/') || typeof window === 'undefined') {
+    return [];
+  }
+  const { protocol, hostname } = window.location;
+  const candidates: string[] = [];
+
+  if (
+    hostname === 'localhost' ||
+    hostname === '127.0.0.1' ||
+    hostname.startsWith('10.') ||
+    hostname.startsWith('192.168.') ||
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(hostname)
+  ) {
+    candidates.push(`${protocol === 'https:' ? 'http:' : protocol}//${hostname}:5000${resolvedPath}`);
+  }
+
+  if (!candidates.includes(`http://127.0.0.1:5000${resolvedPath}`)) {
+    candidates.push(`http://127.0.0.1:5000${resolvedPath}`);
+  }
+  if (!candidates.includes(`http://localhost:5000${resolvedPath}`)) {
+    candidates.push(`http://localhost:5000${resolvedPath}`);
+  }
+
+  return candidates;
+};
+
 /**
- * Shared fetch helper that resolves paths against `API_BASE` and automatically attaches
- * `Authorization: Bearer <token>` and JSON headers to every backend API request.
+ * Shared fetch helper that resolves paths against `API_BASE`, attaches `Authorization: Bearer <token>`,
+ * and automatically falls back to direct local backend URLs (`127.0.0.1:5000` / `localhost:5000`) if a
+ * relative `/api/...` proxy call fails or hits a static host without a backend rewrite.
  */
-export const apiFetch = (input: string, init: RequestInit = {}): Promise<Response> => {
+export const apiFetch = async (input: string, init: RequestInit = {}): Promise<Response> => {
   const headers = getAuthHeaders(init.headers);
-  return fetch(resolveApiUrl(input), {
+  const resolvedUrl = resolveApiUrl(input);
+  const requestInit: RequestInit = {
     ...init,
     headers,
-  });
+  };
+
+  try {
+    const res = await fetch(resolvedUrl, requestInit);
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    const isJson = contentType.includes('application/json');
+    const isProxyOrStaticHostMiss =
+      resolvedUrl.startsWith('/api/') &&
+      !isJson &&
+      (res.status === 404 ||
+        res.status === 405 ||
+        res.status === 502 ||
+        res.status === 503 ||
+        res.status === 504);
+
+    if (!isProxyOrStaticHostMiss) {
+      return res;
+    }
+  } catch (primaryErr) {
+    const fallbacks = getDirectLocalFallbackUrls(resolvedUrl);
+    if (fallbacks.length === 0) {
+      throw primaryErr;
+    }
+    for (const fallbackUrl of fallbacks) {
+      try {
+        return await fetch(fallbackUrl, requestInit);
+      } catch {
+        // Try next candidate
+      }
+    }
+    throw primaryErr;
+  }
+
+  const fallbacks = getDirectLocalFallbackUrls(resolvedUrl);
+  for (const fallbackUrl of fallbacks) {
+    try {
+      return await fetch(fallbackUrl, requestInit);
+    } catch {
+      // Try next candidate
+    }
+  }
+
+  return fetch(resolvedUrl, requestInit);
 };
