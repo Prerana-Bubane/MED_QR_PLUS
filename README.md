@@ -3,7 +3,24 @@
 MedQR+ is a full-stack emergency medical identity and clinical record platform built with **React 19 + TypeScript + Vite + Tailwind CSS v4** on the frontend and **Express 5 + SQLite (`node:sqlite` WAL mode) + Zod + AES-256-GCM** on the backend.
 
 ## Architecture & Security Overview
-
+┌────────────────────────────┐
+│        React Frontend      │
+│   React + TypeScript + Vite│
+└──────────────┬─────────────┘
+               │ /api requests
+               ▼
+┌────────────────────────────┐
+│       Express API          │
+│ Auth • Validation • OTP    │
+│ Access Control • Audit Logs│
+└──────────────┬─────────────┘
+               │
+       ┌───────┴────────┐
+       ▼                ▼
+┌───────────────┐  ┌────────────────┐
+│ SQLite (WAL)  │  │ Crypto Services│
+│ Persistent DB │  │ HKDF + AES-GCM │
+└───────────────┘  └────────────────┘
 - **Backend as Single Source of Truth**: All user profiles, medical records, OTP codes, and hospital audit logs are stored in SQLite (`server/data/medqr.sqlite` in WAL mode) using atomic `BEGIN IMMEDIATE` transactions (`server/db.ts`).
 - **3-Tier Authenticated Encryption at Rest (`server/crypto.ts`)**:
   - Uses **HKDF-SHA256** (`DATA_ENCRYPTION_KEY`) to derive three distinct 256-bit keys (`tier1`, `tier2`, `tier3`) and encrypts patient/hospital records with **AES-256-GCM** (random 96-bit IV + 128-bit authentication tag):
